@@ -42,3 +42,36 @@ jobs:
           git add k8s/overlays/dev/kustomization.yaml
           git commit -m "Automated Deploy to Dev: $IMAGE_TAG"
           git push origin main
+
+      - name: Generate App Token to Talk Back to CI Repo
+        if: always() 
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: my-app-code
+
+      - name: Send Status Back to Application Repo
+        if: always()
+        run: |
+          STATE="success"
+          if [ "${{ job.status }}" != "success" ]; then
+            STATE="failure"
+          fi
+          
+          cat <<EOF > status.json
+          {
+            "state": "$STATE",
+            "context": "CD / deploy-dev (${{ github.event.client_payload.component }})",
+            "description": "GitOps manifest update: $STATE",
+            "target_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+          
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ steps.app-token.outputs.token }}" \
+            https://api.github.com/repos/${{ github.repository_owner }}/my-app-code/statuses/${{ github.event.client_payload.commit_sha }} \
+            -d @status.json
