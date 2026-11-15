@@ -23,7 +23,7 @@ jobs:
         env:
           IMAGE_TAG: ${{ github.event.client_payload.image_tag }}
           COMPONENT: ${{ github.event.client_payload.component }}
-          DOCKERHUB_USER: YOUR_DOCKERHUB_USERNAME
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           echo "Updating Dev overlay for $COMPONENT with tag: $IMAGE_TAG"
           cd k8s/overlays/dev
