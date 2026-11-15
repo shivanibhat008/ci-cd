@@ -1,3 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: dev
+resources:
+  - ../../base
 images:
 - name: backend
   newName: YOUR_DOCKERHUB_USERNAME/backend
@@ -5,13 +10,7 @@ images:
 - name: placeholder-app
   newName: YOUR_DOCKERHUB_USERNAME/hello-app
   newTag: v1.0.0-sha-686261f
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
 configMapGenerator:
-- behavior: replace
-  literals:
-  - APP_VERSION=v1.0.0-sha-686261f
-  name: hello-app-config
 - behavior: replace
   literals:
   - APP_VERSION=backend-v1.2.1-sha-1bbfa51
