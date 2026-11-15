@@ -38,9 +38,10 @@ jobs:
           yq -i 'del(.configMapGenerator[] | select(.name == "'${COMPONENT}'-config"))' kustomization.yaml || true
           
           # 3. Create fresh ConfigMap with unique format
-          kustomize edit add configmap ${COMPONENT}-config --behavior=replace --from-literal=APP_VERSION="${COMPONENT}-${IMAGE_TAG}"
+          kustomize dit add configmap ${COMPONENT}-config --behavior=replace --from-literal=APP_VERSION="${COMPONENT}-${IMAGE_TAG}"
           
       - name: Commit and Push Changes
+        if: steps.update_kustomize_manifest.outcome == 'success'
         env:
           IMAGE_TAG: ${{ github.event.client_payload.image_tag }}
         run: |
@@ -52,7 +53,7 @@ jobs:
           # Add PR to make the push
 
       - name: Rollback on failure
-        if: steps.update_kustomize_manifest.outcome == 'failure'
+        if: always() && (steps.update_kustomize_manifest.outcome == 'failure' || steps.update_kustomize_manifest.outcome == 'cancelled')
         run: |
           echo "Reverting the broken commit in Git..."
 
