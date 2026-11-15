@@ -22,6 +22,7 @@ jobs:
           kustomize-version: "5.0.0"
 
       - name: Update Dev Kustomize Manifests
+        id: update_kustomize_manifest
         env:
           IMAGE_TAG: ${{ github.event.client_payload.image_tag }}
           COMPONENT: ${{ github.event.client_payload.component }}
@@ -48,6 +49,26 @@ jobs:
           git add k8s/overlays/dev/kustomization.yaml
           git commit -m "Automated Deploy to Dev: $IMAGE_TAG"
           git push origin main
+          # Add PR to make the push
+
+      - name: Rollback on failure
+        if: steps.update_kustomize_manifest.outcome == 'failure'
+        run: |
+          echo "Reverting the broken commit in Git..."
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Revert the last commit 
+          git revert --no-edit HEAD
+          git push origin main
+          
+          exit 1
+          #env:
+          #COMPONENT: ${{ github.event.client_payload.component }}
+        #run: |
+          #echo "Deployment failed health check! Rolling back cluster to previous version..."
+          #kubectl rollout undo deployment/${COMPONENT} -n dev
 
       # - name: Generate App Token to Talk Back to CI Repo
       #   if: always() 
