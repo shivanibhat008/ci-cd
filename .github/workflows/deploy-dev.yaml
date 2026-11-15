@@ -7,6 +7,8 @@ on:
 jobs:
   update-dev-manifests:
     runs-on: ubuntu-latest
+    environment: 
+      name: dev
     permissions:
       contents: write # Required to push commits back to the repo
     
