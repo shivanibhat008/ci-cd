@@ -1,14 +1,16 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: dev
-
 resources:
-  - ../../base/backend
+- ../../base/backend
+# The GitHub Actions pipeline will dynamically overwrite 
+# 'YOUR-DOCKER-USERNAME' and 'LATEST-TAG' during the CD run.
 images:
-  - name: backend
-    # The GitHub Actions pipeline will dynamically overwrite 
-    # 'YOUR-DOCKER-USERNAME' and 'LATEST-TAG' during the CD run.
-    newName: YOUR-DOCKER-USERNAME/backend
-    newTag: LATEST-TAG
-
-configMapGenerator: []
+- name: backend
+  newName: bhatshivani/backend
+  newTag: v1.2.1-sha-7b58883
+configMapGenerator:
+- behavior: replace
+  literals:
+  - APP_VERSION=backend-v1.2.1-sha-7b58883
+  name: backend-config
