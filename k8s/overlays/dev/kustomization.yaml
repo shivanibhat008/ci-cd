@@ -1,0 +1,4 @@
+images:
+  - name: placeholder-app
+    newName: placeholder-dockerhub-user/hello-app
+    newTag: sha-a1b2c3d
