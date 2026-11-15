@@ -10,7 +10,6 @@ images:
   newName: bhatshivani/backend
   newTag: v1.2.1-sha-7b58883
 configMapGenerator:
-- behavior: replace
   literals:
   - APP_VERSION=backend-v1.2.1-sha-7b58883
   name: backend-config
