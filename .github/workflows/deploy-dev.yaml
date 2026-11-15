@@ -43,15 +43,15 @@ jobs:
           git commit -m "Automated Deploy to Dev: $IMAGE_TAG"
           git push origin main
 
-      - name: Generate App Token to Talk Back to CI Repo
-        if: always() 
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CI_APP_ID }}
-          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: my-app-code
+      # - name: Generate App Token to Talk Back to CI Repo
+      #   if: always() 
+      #   id: app-token
+      #   uses: actions/create-github-app-token@v1
+      #   with:
+      #     app-id: ${{ secrets.CI_APP_ID }}
+      #     private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+      #     owner: ${{ github.repository_owner }}
+      #     repositories: my-app-code
 
       # - name: Send Status Back to Application Repo
       #   if: always()
