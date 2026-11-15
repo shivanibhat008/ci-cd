@@ -1,7 +1,7 @@
 images:
 - name: backend
   newName: YOUR_DOCKERHUB_USERNAME/backend
-  newTag: v1.2.1-sha-0d89ae7
+  newTag: v1.2.1-sha-1bbfa51
 - name: placeholder-app
   newName: YOUR_DOCKERHUB_USERNAME/hello-app
   newTag: v1.0.0-sha-686261f
@@ -14,5 +14,5 @@ configMapGenerator:
   name: hello-app-config
 - behavior: replace
   literals:
-  - APP_VERSION=backend-v1.2.1-sha-0d89ae7
+  - APP_VERSION=backend-v1.2.1-sha-1bbfa51
   name: backend-config
