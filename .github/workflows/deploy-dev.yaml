@@ -22,15 +22,19 @@ jobs:
       - name: Update Dev Kustomize Manifests
         env:
           IMAGE_TAG: ${{ github.event.client_payload.image_tag }}
-          # This line is currently missing in your file:
           COMPONENT: ${{ github.event.client_payload.component }}
-          DOCKERHUB_USER: YOUR_DOCKERHUB_USERNAME 
+          DOCKERHUB_USER: YOUR_DOCKERHUB_USERNAME
         run: |
           echo "Updating Dev overlay for $COMPONENT with tag: $IMAGE_TAG"
           cd k8s/overlays/dev
           
+          # 1. Update the image SHA
           kustomize edit set image $COMPONENT=$DOCKERHUB_USER/$COMPONENT:$IMAGE_TAG
-          kustomize edit remove configmap ${COMPONENT}-config || true
+          
+          # 2. Use yq to safely delete the old configmap generator from the YAML
+          yq -i 'del(.configMapGenerator[] | select(.name == "'${COMPONENT}'-config"))' kustomization.yaml || true
+          
+          # 3. Create fresh ConfigMap with unique format
           kustomize edit add configmap ${COMPONENT}-config --behavior=replace --from-literal=APP_VERSION="${COMPONENT}-${IMAGE_TAG}"
           
       - name: Commit and Push Changes
