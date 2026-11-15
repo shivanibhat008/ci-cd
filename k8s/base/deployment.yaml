@@ -1,25 +1,25 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: hello-app
+  name: backend
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: hello-app
+      app: backend
   template:
     metadata:
       labels:
-        app: hello-app
+        app: backend
     spec:
       containers:
-        - name: hello-app
+        - name: backend
           image: placeholder-app
           ports:
             - containerPort: 8080
           envFrom:
             - configMapRef:
-                name: hello-app-config
+                name: backend-config
           readinessProbe:
             httpGet:
               path: /health
