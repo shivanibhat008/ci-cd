@@ -1,0 +1,83 @@
+name: Dev CD Pipeline (GitOps State Update)
+
+on:
+  repository_dispatch:
+    types: [deploy-to-dev]
+
+jobs:
+  update-dev-manifests:
+    runs-on: ubuntu-latest
+    environment: 
+      name: dev
+    permissions:
+      contents: write # Required to push commits back to the repo
+    
+    steps:
+      - name: Checkout CD Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: "5.0.0"
+
+      - name: Update Dev Kustomize Manifests
+        env:
+          IMAGE_TAG: ${{ github.event.client_payload.image_tag }}
+          COMPONENT: ${{ github.event.client_payload.component }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          echo "Updating Dev overlay for $COMPONENT with tag: $IMAGE_TAG"
+          cd k8s/overlays/dev
+          
+          # 1. Update the image SHA
+          kustomize edit set image $COMPONENT=$DOCKERHUB_USER/$COMPONENT:$IMAGE_TAG
+          
+          # 2. Use yq to safely delete the old configmap generator from the YAML
+          yq -i 'del(.configMapGenerator[] | select(.name == "'${COMPONENT}'-config"))' kustomization.yaml || true
+          
+          # 3. Create fresh ConfigMap with unique format
+          kustomize edit add configmap ${COMPONENT}-config --behavior=replace --from-literal=APP_VERSION="${COMPONENT}-${IMAGE_TAG}"
+          
+      - name: Commit and Push Changes
+        env:
+          IMAGE_TAG: ${{ github.event.client_payload.image_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/overlays/dev/kustomization.yaml
+          git commit -m "Automated Deploy to Dev: $IMAGE_TAG"
+          git push origin main
+
+      # - name: Generate App Token to Talk Back to CI Repo
+      #   if: always() 
+      #   id: app-token
+      #   uses: actions/create-github-app-token@v1
+      #   with:
+      #     app-id: ${{ secrets.CI_APP_ID }}
+      #     private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+      #     owner: ${{ github.repository_owner }}
+      #     repositories: my-app-code
+
+      # - name: Send Status Back to Application Repo
+      #   if: always()
+      #   run: |
+      #     STATE="success"
+      #     if [ "${{ job.status }}" != "success" ]; then
+      #       STATE="failure"
+      #     fi
+          
+      #     cat <<EOF > status.json
+      #     {
+      #       "state": "$STATE",
+      #       "context": "CD / deploy-dev (${{ github.event.client_payload.component }})",
+      #       "description": "GitOps manifest update: $STATE",
+      #       "target_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      #     }
+      #     EOF
+          
+      #     curl -X POST \
+      #       -H "Accept: application/vnd.github+json" \
+      #       -H "Authorization: Bearer ${{ steps.app-token.outputs.token }}" \
+      #       https://api.github.com/repos/${{ github.repository_owner }}/my-app-code/statuses/${{ github.event.client_payload.commit_sha }} \
+      #       -d @status.json
