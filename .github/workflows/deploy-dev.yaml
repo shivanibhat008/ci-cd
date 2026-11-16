@@ -56,6 +56,8 @@ jobs:
         if: always() && (steps.update_kustomize_manifest.outcome == 'failure' || steps.update_kustomize_manifest.outcome == 'cancelled')
         run: |
           echo "Reverting the broken commit in Git..."
+          echo "Cleaning up uncommitted changes in the runner..."
+          git reset --hard
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
