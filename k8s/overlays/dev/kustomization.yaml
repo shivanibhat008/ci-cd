@@ -8,9 +8,8 @@ resources:
 images:
 - name: backend
   newName: bhatshivani/backend
-  newTag: v1.3.0-sha-915b450
+  newTag: v2.0.0-sha-920ba50
 configMapGenerator:
-- behavior: replace
-  literals:
-  - APP_VERSION=backend-v1.3.0-sha-915b450
+- literals:
+  - APP_VERSION=backend-v2.0.0-sha-920ba50
   name: backend-config
