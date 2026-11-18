@@ -129,10 +129,10 @@ jobs:
           git push origin main
           # Add PR to make the push
 
-      - name: Rollback on failure
+      - name: Deploymnet failed
         if: always() && (steps.update_kustomize_manifest.outcome == 'failure' || steps.update_kustomize_manifest.outcome == 'cancelled')
         run: |
-          echo "Deployment failed health check! Rolling back cluster to previous version..."
+          echo "Deployment failed. Fix forward and redeploy..."
           exit 1
           #env:
           #COMPONENT: ${{ github.event.client_payload.component }}
