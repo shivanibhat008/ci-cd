@@ -1,25 +1,275 @@
+name: Deploy to Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Immutable Docker image tag from ECR (e.g., v1.1.0 or commit SHA)"
+        required: true
+        type: string
+      jira_issue_key:
+        description: "Jira Issue Key (e.g., PROJ-123)"
+        required: true
+        type: string
+      rollback_mode:
+        description: "Rollback strategy if deployment or tests fail"
+        required: true
+        type: choice
+        default: "gated"
+        options:
+          - gated
+          - auto
+  workflow_call:
+    inputs:
+      image_tag:
+        required: true
+        type: string
+      jira_issue_key:
+        required: true
+        type: string
+      rollback_mode:
+        required: false
+        type: string
+        default: "gated"
+
+permissions:
+  id-token: write   # Required for GitHub OIDC (AWS & HashiCorp Vault)
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: staging-eks-cluster
+  ECR_REPOSITORY: my-app
+  K8S_NAMESPACE: staging
+  DEPLOYMENT_NAME: backend
+
 jobs:
-  deploy:
+  # ============================================================
+  # STAGE 5: QA Approval & Staging Deployment
+  # ============================================================
+  deploy-staging:
+    name: QA Approval & Deploy to Staging EKS
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write   # REQUIRED: Allows GitHub to generate the OIDC JWT
-      contents: read    
-    
+    # Configure 'Required reviewers' (QA Lead) on the 'staging' environment
+    environment:
+      name: staging
+      url: https://example.com
+
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::123456789012:role/GitHubActions-EKS-Deployment-Role
-          aws-region: eu-west-1
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Generate Kubeconfig
+      - name: Retrieve Secrets from HashiCorp Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ vars.VAULT_ADDR }}
+          method: jwt
+          role: github-actions-staging
+          secrets: |
+            secret/data/staging/app * ;
+
+      - name: Update kubeconfig for Staging EKS
         run: |
-          # This command uses the temporary IAM Role session to generate the kubeconfig
-          aws eks update-kubeconfig --region eu-west-1 --name ${{ inputs.component_name }}-staging-cluster
-        
-          
-      - name: Deploy via Kustomize
-        run: kubectl apply -k k8s/overlays/staging
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      - name: Deploy Image to Staging EKS
+        id: deploy
+        continue-on-error: true
+        run: |
+          kubectl set image deployment/${DEPLOYMENT_NAME} \
+            ${DEPLOYMENT_NAME}=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}://{ECR_REPOSITORY}:${{ inputs.image_tag }} \
+            -n ${K8S_NAMESPACE}
+
+          kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE} --timeout=300s
+
+      # Update Jira immediately based on deployment result
+      - name: Update Jira (Staging Deployment Failed)
+        if: steps.deploy.outcome == 'failure'
+        uses: ./actions/jira-transition@main
+        with:
+          jira-base-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          source-text: ${{ inputs.jira_issue_key }}
+          target-status: "Staging Deployment Failed"
+
+      - name: Fail Job to Trigger Rollback
+        if: steps.deploy.outcome == 'failure'
+        run: exit 1
+
+      - name: Update Jira (Staging Deployment Success)
+        if: steps.deploy.outcome == 'success'
+        uses: ./actions/jira-transition@main
+        with:
+          jira-base-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          source-text: ${{ inputs.jira_issue_key }}
+          target-status: "Staging Deployment Success"
+
+  # ============================================================
+  # STAGE 6: Run Staging Tests & Promotion Gate
+  # ============================================================
+  staging-tests:
+    name: Run Staging Test Suite
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for Staging EKS
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      - name: Run Integration Tests
+        id: integration
+        continue-on-error: true
+        run: npm run test:integration
+
+      - name: Run Smoke Tests
+        id: smoke
+        if: steps.integration.outcome == 'success'
+        continue-on-error: true
+        run: npm run test:smoke
+
+      - name: Run E2E Tests
+        id: e2e
+        if: steps.smoke.outcome == 'success'
+        continue-on-error: true
+        run: npm run test:e2e
+
+      - name: Run Performance Tests
+        id: perf
+        if: steps.e2e.outcome == 'success'
+        continue-on-error: true
+        run: npm run test:performance
+
+      - name: Run Regression Tests
+        id: regression
+        if: steps.perf.outcome == 'success'
+        continue-on-error: true
+        run: npm run test:regression
+
+      - name: Check Test Suite Results
+        id: test-gate
+        run: |
+          if [[ "${{ steps.integration.outcome }}" != "success" || \
+                "${{ steps.smoke.outcome }}" != "success" || \
+                "${{ steps.e2e.outcome }}" != "success" || \
+                "${{ steps.perf.outcome }}" != "success" || \
+                "${{ steps.regression.outcome }}" != "success" ]]; then
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update Jira (Staging Tests Failed)
+        if: steps.test-gate.outputs.passed == 'false'
+        uses: ./actions/jira-transition@main
+        with:
+          jira-base-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          source-text: ${{ inputs.jira_issue_key }}
+          target-status: "Staging Tests Failed"
+
+      - name: Fail Job to Trigger Rollback
+        if: steps.test-gate.outputs.passed == 'false'
+        run: exit 1
+
+      - name: Update Jira (Staging Tests Success)
+        if: steps.test-gate.outputs.passed == 'true'
+        uses: ./actions/jira-transition@main
+        with:
+          jira-base-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          source-text: ${{ inputs.jira_issue_key }}
+          target-status: "Staging Tests Success"
+
+      - name: Promote to Prod (Prepare Release)
+        if: steps.test-gate.outputs.passed == 'true'
+        run: |
+          echo "Image ${{ inputs.image_tag }} verified in Staging and ready for Production release tag."
+
+  # ============================================================
+  # ROLLBACK PATH A: Auto Rollback (Runs immediately on failure)
+  # ============================================================
+  auto-rollback-staging:
+    name: Auto Rollback Staging EKS
+    needs: [deploy-staging, staging-tests]
+    if: |
+      always() &&
+      (needs.deploy-staging.result == 'failure' || needs.staging-tests.result == 'failure') &&
+      inputs.rollback_mode == 'auto'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Execute Immediate Rollback
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+          kubectl rollout undo deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE}
+          kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE} --timeout=180s
+
+      - name: Update Jira (Staging Rolled Back)
+        uses: ./actions/jira-transition@main
+        with:
+          jira-base-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          source-text: ${{ inputs.jira_issue_key }}
+          target-status: "Staging Rolled Back"
+
+  # ============================================================
+  # ROLLBACK PATH B: Gated Rollback (Pauses for Manual Approval)
+  # ============================================================
+  gated-rollback-staging:
+    name: Gated Rollback Staging EKS (Approval Required)
+    needs: [deploy-staging, staging-tests]
+    if: |
+      always() &&
+      (needs.deploy-staging.result == 'failure' || needs.staging-tests.result == 'failure') &&
+      inputs.rollback_mode == 'gated'
+    runs-on: ubuntu-latest
+    # Configure 'Required reviewers' on 'staging-rollback' environment to gate the rollback
+    environment:
+      name: staging-rollback
+
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Execute Approved Rollback
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+          kubectl rollout undo deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE}
+          kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE} --timeout=180s
+
+      - name: Update Jira (Staging Rolled Back)
+        uses: ./actions/jira-transition@main
+        with:
+          jira-base-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
