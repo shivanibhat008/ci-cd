@@ -30,6 +30,16 @@ This repository acts as the **single source of truth** for cluster state:
 
 ---
 
+## Prerequisites
+
+To run this workflow successfully against a Dev Kubernetes cluster, ensure the following are configured:
+* A `dev` GitHub Environment configured in the calling repository (`my-app-code`).
+* A GitHub App installed with **Contents (Read & Write)** permission scoped strictly to `platform-ci-cd`.
+* Cluster access configured for `kubectl` targeting the `dev` namespace.
+* `k8s/overlays/dev/kustomization.yaml` referencing all managed base resources (`backend`, `frontend`, `db-migrations`).
+
+---
+
 ##  Reusable Workflow Contract (`deploy-dev.yaml`)
 
 The workflow is triggered via `workflow_call` from `my-app-code` after a successful Docker image build and push.
@@ -90,10 +100,3 @@ If a rollout or migration job fails or times out, a diagnostic step runs **befor
 
 ---
 
-## Prerequisites
-
-To run this workflow successfully against a Dev Kubernetes cluster, ensure the following are configured:
-* A `dev` GitHub Environment configured in the calling repository (`my-app-code`).
-* A GitHub App installed with **Contents (Read & Write)** permission scoped strictly to `platform-ci-cd`.
-* Cluster access configured for `kubectl` targeting the `dev` namespace.
-* `k8s/overlays/dev/kustomization.yaml` referencing all managed base resources (`backend`, `frontend`, `db-migrations`).
