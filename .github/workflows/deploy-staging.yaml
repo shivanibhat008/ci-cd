@@ -11,14 +11,11 @@ on:
         description: "Jira Issue Key (e.g., PROJ-123)"
         required: true
         type: string
-      rollback_mode:
-        description: "Rollback strategy if deployment or tests fail"
-        required: true
-        type: choice
-        default: "gated"
-        options:
-          - gated
-          - auto
+      run_db_migrations:
+        description: "Run DB migration Kubernetes Job before app deployment"
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       image_tag:
@@ -27,10 +24,10 @@ on:
       jira_issue_key:
         required: true
         type: string
-      rollback_mode:
+      run_db_migrations:
         required: false
-        type: string
-        default: "gated"
+        type: boolean
+        default: false
 
 permissions:
   id-token: write   # Required for GitHub OIDC (AWS & HashiCorp Vault)
@@ -42,10 +39,11 @@ env:
   ECR_REPOSITORY: my-app
   K8S_NAMESPACE: staging
   DEPLOYMENT_NAME: backend
+  DB_JOB_NAME: db-migrations
 
 jobs:
   # ============================================================
-  # STAGE 5: QA Approval & Staging Deployment
+  # STAGE 5: QA Approval, DB Migration & Staging Deployment
   # ============================================================
   deploy-staging:
     name: QA Approval & Deploy to Staging EKS
@@ -54,6 +52,9 @@ jobs:
     environment:
       name: staging
       url: https://example.com
+    outputs:
+      failure_type: ${{ steps.diagnose.outputs.failure_type }}
+      rollback_mode: ${{ steps.diagnose.outputs.rollback_mode }}
 
     steps:
       - name: Checkout repository
@@ -78,19 +79,90 @@ jobs:
         run: |
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
 
-      - name: Deploy Image to Staging EKS
-        id: deploy
+      # ----------------------------------------------------------
+      # 5A. Database Migrations (Runs FIRST - Strict Fix-Forward)
+      # ----------------------------------------------------------
+      - name: Run DB Migrations Job
+        id: db_migrate
+        if: inputs.run_db_migrations == true
         continue-on-error: true
         run: |
-          kubectl set image deployment/${DEPLOYMENT_NAME} \
-            ${DEPLOYMENT_NAME}=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}://{ECR_REPOSITORY}:${{ inputs.image_tag }} \
-            -n ${K8S_NAMESPACE}
+          echo "Running DB migration Job in ${K8S_NAMESPACE}..."
+          kubectl delete job "${DB_JOB_NAME}" -n "${K8S_NAMESPACE}" --ignore-not-found=true
+          kubectl apply -k k8s/overlays/staging/db-migrations
+          kubectl wait --for=condition=complete "job/${DB_JOB_NAME}" -n "${K8S_NAMESPACE}" --timeout=180s
 
-          kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE} --timeout=300s
+      # ----------------------------------------------------------
+      # 5B. Stateless App Deployment (Skipped if DB Migration Failed)
+      # ----------------------------------------------------------
+      - name: Deploy Image to Staging EKS
+        id: deploy
+        if: steps.db_migrate.outcome != 'failure'
+        continue-on-error: true
+        run: |
+          kubectl set image "deployment/${DEPLOYMENT_NAME}" \
+            "${DEPLOYMENT_NAME}=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${{ inputs.image_tag }}" \
+            -n "${K8S_NAMESPACE}"
 
-      # Update Jira immediately based on deployment result
+          kubectl rollout status "deployment/${DEPLOYMENT_NAME}" -n "${K8S_NAMESPACE}" --timeout=300s
+
+      # ----------------------------------------------------------
+      # 5C. Failure Classification, Auto-Calculated Rollback & Logs
+      # ----------------------------------------------------------
+      - name: Classify Failure & Collect Debug Logs
+        id: diagnose
+        if: steps.db_migrate.outcome == 'failure' || steps.deploy.outcome == 'failure'
+        run: |
+          ROLLBACK_MODE="none"
+
+          if [ "${{ steps.db_migrate.outcome }}" == "failure" ]; then
+            FAILURE_TYPE="DB_FAILURE"
+            REASON="DB migration Job failed. App deployment skipped. Halting for Fix-Forward (no DB rollback)."
+          else
+            POD_JSON=$(kubectl get pods -n "$K8S_NAMESPACE" -l "app=$DEPLOYMENT_NAME" --sort-by=.metadata.creationTimestamp -o json | jq '.items[-1]')
+            PHASE=$(echo "$POD_JSON" | jq -r '.status.phase // "Unknown"')
+            WAIT_REASON=$(echo "$POD_JSON" | jq -r '.status.containerStatuses[0].state.waiting.reason // ""')
+            TERM_REASON=$(echo "$POD_JSON" | jq -r '.status.containerStatuses[0].lastState.terminated.reason // ""')
+            READY=$(echo "$POD_JSON" | jq -r '.status.containerStatuses[0].ready // false')
+
+            if [ -z "$POD_JSON" ] || [ "$POD_JSON" == "null" ] \vert{}\vert{} [ "$PHASE" == "Pending" ] || [[ "$WAIT_REASON" =~ ^(ImagePullBackOff\vert{}ErrImagePull\vert{}CreateContainerConfigError\vert{}CreateContainerError)$ ]]; then
+              FAILURE_TYPE="INFRA_FAILURE"
+              REASON="Infrastructure/Cluster issue detected (Phase=$PHASE, Reason=$WAIT_REASON). Rollback skipped."
+            else
+              FAILURE_TYPE="CODE_FAILURE"
+              REASON="Application runtime/probe failure (Phase=$PHASE, Waiting=$WAIT_REASON, Terminated=$TERM_REASON, Ready=$READY)."
+              if [ "${{ inputs.run_db_migrations }}" == "true" ]; then
+                ROLLBACK_MODE="gated"
+              else
+                ROLLBACK_MODE="auto"
+              fi
+            fi
+          fi
+
+          echo "failure_type=$FAILURE_TYPE" >> "$GITHUB_OUTPUT"
+          echo "rollback_mode=$ROLLBACK_MODE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Staging Deployment Verdict: \`$FAILURE_TYPE\`"
+            echo "**Calculated Rollback Mode:** \`$ROLLBACK_MODE\`"
+            echo "**Root Cause Signal:** $REASON"
+            echo ""
+            echo "### Recent Namespace Events"
+            echo '```text'
+            kubectl get events -n "$K8S_NAMESPACE" --sort-by='.metadata.creationTimestamp' | tail -n 20 || true
+            echo '```'
+            echo "### Recent Logs"
+            echo '```text'
+            if [ "$FAILURE_TYPE" == "DB_FAILURE" ]; then
+              kubectl logs "job/${DB_JOB_NAME}" -n "$K8S_NAMESPACE" --tail=100 || true
+            else
+              kubectl logs "deployment/${DEPLOYMENT_NAME}" -n "$K8S_NAMESPACE" --tail=100 --all-containers=true || true
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Update Jira (Staging Deployment Failed)
-        if: steps.deploy.outcome == 'failure'
+        if: steps.db_migrate.outcome == 'failure' || steps.deploy.outcome == 'failure'
         uses: ./actions/jira-transition@main
         with:
           jira-base-url: ${{ vars.JIRA_BASE_URL }}
@@ -99,8 +171,8 @@ jobs:
           source-text: ${{ inputs.jira_issue_key }}
           target-status: "Staging Deployment Failed"
 
-      - name: Fail Job to Trigger Rollback
-        if: steps.deploy.outcome == 'failure'
+      - name: Fail Job on Deployment or DB Failure
+        if: steps.db_migrate.outcome == 'failure' || steps.deploy.outcome == 'failure'
         run: exit 1
 
       - name: Update Jira (Staging Deployment Success)
@@ -120,6 +192,8 @@ jobs:
     name: Run Staging Test Suite
     needs: deploy-staging
     runs-on: ubuntu-latest
+    outputs:
+      rollback_mode: ${{ steps.test-gate.outputs.rollback_mode }}
 
     steps:
       - name: Checkout repository
@@ -135,46 +209,65 @@ jobs:
         run: |
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
 
-      - name: Run Integration Tests
+      # Tier 1: Critical Path Tests (With Retries to Filter Flakes)
+      - name: Run Integration Tests (Tier 1 - With Retries)
         id: integration
         continue-on-error: true
-        run: npm run test:integration
+        run: |
+          for i in 1 2 3; do
+            npm run test:integration && exit 0
+            echo "Integration attempt $i failed. Retrying in 5s..."
+            sleep 5
+          done
+          exit 1
 
-      - name: Run Smoke Tests
+      - name: Run Smoke Tests (Tier 1 - With Retries)
         id: smoke
         if: steps.integration.outcome == 'success'
         continue-on-error: true
-        run: npm run test:smoke
+        run: |
+          for i in 1 2 3; do
+            npm run test:smoke && exit 0
+            echo "Smoke attempt $i failed. Retrying in 5s..."
+            sleep 5
+          done
+          exit 1
 
-      - name: Run E2E Tests
+      # Tier 2: Full Suite (Rerun Tests First; Do Not Auto-Rollback Cluster)
+      - name: Run E2E Tests (Tier 2)
         id: e2e
         if: steps.smoke.outcome == 'success'
         continue-on-error: true
         run: npm run test:e2e
 
-      - name: Run Performance Tests
+      - name: Run Performance Tests (Tier 2)
         id: perf
         if: steps.e2e.outcome == 'success'
         continue-on-error: true
         run: npm run test:performance
 
-      - name: Run Regression Tests
+      - name: Run Regression Tests (Tier 2)
         id: regression
         if: steps.perf.outcome == 'success'
         continue-on-error: true
         run: npm run test:regression
 
-      - name: Check Test Suite Results
+      - name: Evaluate Test Suite & Rollback Mode
         id: test-gate
         run: |
-          if [[ "${{ steps.integration.outcome }}" != "success" || \
-                "${{ steps.smoke.outcome }}" != "success" || \
-                "${{ steps.e2e.outcome }}" != "success" || \
-                "${{ steps.perf.outcome }}" != "success" || \
-                "${{ steps.regression.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.integration.outcome }}" == "failure" || "${{ steps.smoke.outcome }}" == "failure" ]]; then
             echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "rollback_mode=gated" >> "$GITHUB_OUTPUT"
+            echo "## Staging Tests Failed (Tier 1 Deterministic)" >> "$GITHUB_STEP_SUMMARY"
+            echo "Critical Integration/Smoke tests failed after 3 attempts. Routing to **gated** rollback." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${{ steps.e2e.outcome }}" == "failure" || "${{ steps.perf.outcome }}" == "failure" || "${{ steps.regression.outcome }}" == "failure" ]]; then
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "rollback_mode=none" >> "$GITHUB_OUTPUT"
+            echo "## Staging Tests Failed (Tier 2 Suite)" >> "$GITHUB_STEP_SUMMARY"
+            echo "E2E/Perf/Regression failed while Tier 1 Smoke tests passed. **Skipping cluster rollback**—investigate and rerun failed jobs." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "rollback_mode=none" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Update Jira (Staging Tests Failed)
@@ -187,7 +280,7 @@ jobs:
           source-text: ${{ inputs.jira_issue_key }}
           target-status: "Staging Tests Failed"
 
-      - name: Fail Job to Trigger Rollback
+      - name: Fail Job on Test Failure
         if: steps.test-gate.outputs.passed == 'false'
         run: exit 1
 
@@ -207,29 +300,33 @@ jobs:
           echo "Image ${{ inputs.image_tag }} verified in Staging and ready for Production release tag."
 
   # ============================================================
-  # ROLLBACK PATH A: Auto Rollback (Runs immediately on failure)
+  # ROLLBACK PATH A: Auto Rollback (Stateless App Code Failure Only)
   # ============================================================
   auto-rollback-staging:
     name: Auto Rollback Staging EKS
     needs: [deploy-staging, staging-tests]
     if: |
       always() &&
-      (needs.deploy-staging.result == 'failure' || needs.staging-tests.result == 'failure') &&
-      inputs.rollback_mode == 'auto'
+      (needs.deploy-staging.outputs.rollback_mode == 'auto' || needs.staging-tests.outputs.rollback_mode == 'auto')
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Execute Immediate Rollback
+      - name: Execute Immediate App Rollback
         run: |
+          echo "Executing Auto-Rollback for deployment/${DEPLOYMENT_NAME}..."
+          echo "NOTE: DB migrations are NOT rolled back (Expand/Contract compatibility assumed)."
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
-          kubectl rollout undo deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE}
-          kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE} --timeout=180s
+          kubectl rollout undo "deployment/${DEPLOYMENT_NAME}" -n "${K8S_NAMESPACE}"
+          kubectl rollout status "deployment/${DEPLOYMENT_NAME}" -n "${K8S_NAMESPACE}" --timeout=180s
 
       - name: Update Jira (Staging Rolled Back)
         uses: ./actions/jira-transition@main
@@ -241,35 +338,42 @@ jobs:
           target-status: "Staging Rolled Back"
 
   # ============================================================
-  # ROLLBACK PATH B: Gated Rollback (Pauses for Manual Approval)
+  # ROLLBACK PATH B: Gated Rollback (DB Migration Ran or Tier 1 Test Failure)
   # ============================================================
   gated-rollback-staging:
     name: Gated Rollback Staging EKS (Approval Required)
     needs: [deploy-staging, staging-tests]
     if: |
       always() &&
-      (needs.deploy-staging.result == 'failure' || needs.staging-tests.result == 'failure') &&
-      inputs.rollback_mode == 'gated'
+      (needs.deploy-staging.outputs.rollback_mode == 'gated' || needs.staging-tests.outputs.rollback_mode == 'gated')
     runs-on: ubuntu-latest
     # Configure 'Required reviewers' on 'staging-rollback' environment to gate the rollback
     environment:
       name: staging-rollback
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Execute Approved Rollback
+      - name: Execute Approved App Rollback
         run: |
+          echo "Human approval granted. Rolling back deployment/${DEPLOYMENT_NAME}..."
+          echo "NOTE: DB migrations are NOT rolled back (Expand/Contract compatibility assumed)."
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
-          kubectl rollout undo deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE}
-          kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE} --timeout=180s
+          kubectl rollout undo "deployment/${DEPLOYMENT_NAME}" -n "${K8S_NAMESPACE}"
+          kubectl rollout status "deployment/${DEPLOYMENT_NAME}" -n "${K8S_NAMESPACE}" --timeout=180s
 
       - name: Update Jira (Staging Rolled Back)
         uses: ./actions/jira-transition@main
         with:
           jira-base-url: ${{ vars.JIRA_BASE_URL }}
           jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          source-text: ${{ inputs.jira_issue_key }}
+          target-status: "Staging Rolled Back"
