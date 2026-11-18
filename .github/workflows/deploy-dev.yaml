@@ -1,20 +1,46 @@
-name: Dev CD Pipeline (GitOps State Update)
+name: Dev CD Pipeline (Deploy & Update)
 
 on:
-  repository_dispatch:
-    types: [deploy-to-dev]
+  workflow_call:
+    inputs:
+      base_version:
+        description: "The semantic version base (e.g., v1.3.0)"
+        required: true
+        type: string
+      component:
+        description: "The name of the component (e.g., backend)"
+        required: true
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      CI_APP_ID:
+        required: true
+      CI_APP_PRIVATE_KEY:
+        required: true
 
 jobs:
-  update-dev-manifests:
+  update-and-deploy:
     runs-on: ubuntu-latest
     environment: 
       name: dev
-    permissions:
-      contents: write # Required to push commits back to the repo
+    #timeout-minutes: 5
     
     steps:
+      - name: Generate CD Repo Token
+        id: cd-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ci-cd
+
       - name: Checkout CD Repository
         uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ci-cd
+          token: ${{ steps.cd-token.outputs.token }}
 
       - name: Setup Kustomize
         uses: imranismail/setup-kustomize@v2
@@ -24,26 +50,44 @@ jobs:
       - name: Update Dev Kustomize Manifests
         id: update_kustomize_manifest
         env:
-          IMAGE_TAG: ${{ github.event.client_payload.image_tag }}
-          COMPONENT: ${{ github.event.client_payload.component }}
+          BASE_VERSION: ${{ inputs.base_version }}
+          COMPONENT: ${{ inputs.component }}
           DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          echo "Updating Dev overlay for $COMPONENT with tag: $IMAGE_TAG"
+          # Dynamically grab the first 7 characters of the my-app-code commit SHA
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          FULL_TAG="${BASE_VERSION}-sha-${SHORT_SHA}"
+          
+          echo "Updating Dev overlay for $COMPONENT with tag: $FULL_TAG"
           cd k8s/overlays/dev
           
-          # 1. Update the image SHA
-          kustomize edit set image $COMPONENT=$DOCKERHUB_USER/$COMPONENT:$IMAGE_TAG
+          # 1. Set the new image
+          kustomize edit set image $COMPONENT=$DOCKERHUB_USER/$COMPONENT:$FULL_TAG
           
-          # 2. Use yq to safely delete the old configmap generator from the YAML
+          # 2. Safely delete old ConfigMap generation
           yq -i 'del(.configMapGenerator[] | select(.name == "'${COMPONENT}'-config"))' kustomization.yaml || true
           
-          # 3. Create fresh ConfigMap with unique format
-          kustomize edit add configmap ${COMPONENT}-config --from-literal=APP_VERSION="${COMPONENT}-${IMAGE_TAG}"
+          # 3. Add new ConfigMap generation
+          kustomize edit add configmap ${COMPONENT}-config --from-literal=APP_VERSION="${COMPONENT}-${FULL_TAG}"
           
+          #echo "--- VERIFYING GENERATED KUSTOMIZE MANIFEST ---"
+          #kustomize build .
+
+      # - name: Deploy to Kubernetes Cluster
+      #   id: deploy
+      #   run: |
+      #     kubectl apply -k k8s/overlays/dev
+          
+      #     echo "--- VERIFYING LIVE CONFIGMAP IN CLUSTER ---"
+      #     kubectl get configmap ${{ inputs.component }}-config -n dev -o yaml
+          
+      #     kubectl rollout status deployment/${{ inputs.component }} -n dev --timeout=90s
+
       - name: Commit and Push Changes
         if: steps.update_kustomize_manifest.outcome == 'success'
         env:
-          IMAGE_TAG: ${{ github.event.client_payload.image_tag }}
+          COMPONENT: ${{ inputs.component }}
+          BASE_VERSION: ${{ inputs.base_version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -62,36 +106,4 @@ jobs:
         #run: |
           #echo "Deployment failed health check! Rolling back cluster to previous version..."
           #kubectl rollout undo deployment/${COMPONENT} -n dev
-
-      # - name: Generate App Token to Talk Back to CI Repo
-      #   if: always() 
-      #   id: app-token
-      #   uses: actions/create-github-app-token@v1
-      #   with:
-      #     app-id: ${{ secrets.CI_APP_ID }}
-      #     private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
-      #     owner: ${{ github.repository_owner }}
-      #     repositories: my-app-code
-
-      # - name: Send Status Back to Application Repo
-      #   if: always()
-      #   run: |
-      #     STATE="success"
-      #     if [ "${{ job.status }}" != "success" ]; then
-      #       STATE="failure"
-      #     fi
           
-      #     cat <<EOF > status.json
-      #     {
-      #       "state": "$STATE",
-      #       "context": "CD / deploy-dev (${{ github.event.client_payload.component }})",
-      #       "description": "GitOps manifest update: $STATE",
-      #       "target_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-      #     }
-      #     EOF
-          
-      #     curl -X POST \
-      #       -H "Accept: application/vnd.github+json" \
-      #       -H "Authorization: Bearer ${{ steps.app-token.outputs.token }}" \
-      #       https://api.github.com/repos/${{ github.repository_owner }}/my-app-code/statuses/${{ github.event.client_payload.commit_sha }} \
-      #       -d @status.json
