@@ -3,8 +3,8 @@ kind: Kustomization
 namespace: dev
 resources:
 - ../../base/backend
-# The GitHub Actions pipeline will dynamically overwrite 
-# 'YOUR-DOCKER-USERNAME' and 'LATEST-TAG' during the CD run.
+- ../../base/db-migration
+- ../../base/frontend
 images:
 - name: backend
   newName: bhatshivani/backend
@@ -13,3 +13,6 @@ configMapGenerator:
 - literals:
   - APP_VERSION=backend-v3.1.0-sha-ed90ec9
   name: backend-config
+
+# patches:
+#   - path: ./observability-patch.yaml

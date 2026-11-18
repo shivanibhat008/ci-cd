@@ -29,7 +29,7 @@ jobs:
     steps:
       - name: Generate CD Repo Token
         id: cd-token
-        uses: actions/create-github-app-token@main
+        uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.CI_APP_ID }}
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
@@ -69,6 +69,9 @@ jobs:
           
           # 3. Add new ConfigMap generation
           kustomize edit add configmap ${COMPONENT}-config --from-literal=APP_VERSION="${COMPONENT}-${FULL_TAG}"
+          
+          #echo "--- VERIFYING GENERATED KUSTOMIZE MANIFEST ---"
+          #kustomize build .
           
           #echo "--- VERIFYING GENERATED KUSTOMIZE MANIFEST ---"
           #kustomize build .
@@ -139,6 +142,37 @@ jobs:
         #run: |
           #echo "Deployment failed health check! Rolling back cluster to previous version..."
           #kubectl rollout undo deployment/${COMPONENT} -n dev
+
+        - name: Deploy to Kubernetes Cluster
+        id: deploy
+        env:
+          COMPONENT: ${{ inputs.component }}
+        run: |
+          if [ "$COMPONENT" == "db-migrations" ]; then
+            echo "Running DB migration Job in dev..."
+            kubectl delete job db-migrations -n dev --ignore-not-found=true
+            kubectl apply -k k8s/overlays/dev
+            kubectl wait --for=condition=complete job/db-migrations -n dev --timeout=120s
+          else
+            echo "Deploying application: $COMPONENT to dev..."
+            kubectl apply -k k8s/overlays/dev
+            kubectl rollout status "deployment/${COMPONENT}" -n dev --timeout=90s
+          fi
+
+      - name: Commit and Push Changes
+        if: success()
+        env:
+          COMPONENT: ${{ inputs.component }}
+          BASE_VERSION: ${{ inputs.base_version }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          FULL_TAG="${BASE_VERSION}-sha-${SHORT_SHA}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/overlays/dev/kustomization.yaml
+          git commit -m "Automated Deploy to Dev: ${COMPONENT} (${FULL_TAG})"
+          git push origin main
 
       # - name: Fix-Forward Diagnostics & Cleanup (No Rollback)
       #   if: failure() || cancelled()

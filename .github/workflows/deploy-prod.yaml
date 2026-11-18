@@ -1,0 +1,252 @@
+name: Deploy to Production (Release)
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  id-token: write   # Required for GitHub OIDC (AWS & HashiCorp Vault)
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: prod-eks-cluster
+  ECR_REPOSITORY: my-app
+  K8S_NAMESPACE: production
+  DEPLOYMENT_NAME: backend
+
+jobs:
+  # ============================================================
+  # STAGE 7A: Extract Release Metadata & Create CRQ Ticket
+  # ============================================================
+  prepare-release:
+    name: Create CRQ Ticket & Resolve Jira Issue
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.meta.outputs.version }}
+      jira_issue_key: ${{ steps.meta.outputs.jira_key }}
+      crq_number: ${{ steps.crq.outputs.crq_number }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Extract Release Version & Jira Issue Key
+        id: meta
+        run: |
+          RELEASE_VERSION="${GITHUB_REF_NAME}"
+          # Extract Jira key from the tag annotation or latest commit message (e.g., PROJ-123)
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          JIRA_KEY=$(echo "$COMMIT_MSG" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -n 1)
+
+          if [ -z "$JIRA_KEY" ]; then
+            echo "Error: No Jira issue key found in release commit message."
+            exit 1
+          fi
+
+          echo "Release Version: $RELEASE_VERSION"
+          echo "Jira Issue Key: $JIRA_KEY"
+          echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "jira_key=$JIRA_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Create CRQ Ticket (Prod Deployment)
+        id: crq
+        run: |
+          # Replace with your ITSM / ServiceNow / Jira Service Management CRQ API call
+          CRQ_RESPONSE=$(curl -s -f -X POST "${{ vars.CRQ_API_URL }}/api/now/table/change_request" \
+            -u "${{ secrets.CRQ_USERNAME }}:${{ secrets.CRQ_PASSWORD }}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            --data "{
+              \"short_description\": \"Production Release ${{ steps.meta.outputs.version }} (${{ steps.meta.outputs.jira_key }})\",
+              \"description\": \"Automated Production EKS deployment triggered by tag ${{ steps.meta.outputs.version }}\",
+              \"category\": \"Software\",
+              \"type\": \"Normal\"
+            }")
+
+          CRQ_NUM=$(echo "$CRQ_RESPONSE" | jq -r '.result.number // "CRQ-MANUAL-PENDING"')
+          echo "Created CRQ Ticket: $CRQ_NUM"
+          echo "crq_number=$CRQ_NUM" >> "$GITHUB_OUTPUT"
+
+  # ============================================================
+  # STAGE 7B: Manual Approval (Per CRQ) & Deploy to Prod EKS
+  # ============================================================
+  deploy-prod:
+    name: Manual Approval & Deploy to Prod EKS
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    # Configure 'Required reviewers' on the 'production' environment in GitHub Settings
+    environment:
+      name: production
+      url: https://example.com
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log Approved CRQ Details
+        run: |
+          echo "Proceeding with Production Deployment under CRQ: ${{ needs.prepare-release.outputs.crq_number }}"
+          echo "Version: ${{ needs.prepare-release.outputs.release_version }}"
+
+      # Platform Integration: GitHub OIDC -> AWS
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Platform Integration: GitHub OIDC -> HashiCorp Vault
+      - name: Retrieve Production Secrets from HashiCorp Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ vars.VAULT_ADDR }}
+          method: jwt
+          role: github-actions-prod
+          secrets: |
+            secret/data/prod/app * ;
+
+      - name: Update kubeconfig for Prod EKS
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      - name: Deploy Release Image to Prod EKS
+        id: deploy
+        continue-on-error: true
+        run: |
+          kubectl set image deployment/${DEPLOYMENT_NAME} \
+            ${DEPLOYMENT_NAME}=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}://{ECR_REPOSITORY}:${{ needs.prepare-release.outputs.release_version }} \
+            -n ${K8S_NAMESPACE}
+
+          kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE} --timeout=300s
+
+      # Deployment Failed -> Rollback Deployment & Update Jira
+      - name: Auto Rollback Production Deployment
+        if: steps.deploy.outcome == 'failure'
+        run: |
+          echo "Production deployment failed! Initiating immediate rollback..."
+          kubectl rollout undo deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE}
+          kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE} --timeout=180s
+
+      - name: Update Jira (Prod Deployment Failed - Hotfix Needed)
+        if: steps.deploy.outcome == 'failure'
+        uses: your-org/shared-actions/.github/actions/jira-transition@v1
+        with:
+          jira-base-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          source-text: ${{ needs.prepare-release.outputs.jira_issue_key }}
+          target-status: "Prod Deployment Failed"
+
+      - name: Fail Job After Rollback
+        if: steps.deploy.outcome == 'failure'
+        run: exit 1
+
+  # ============================================================
+  # STAGE 8: Post-Deployment Checks (Prod) & Observability
+  # ============================================================
+  post-deploy-checks:
+    name: Post-Deployment Verification & Monitoring
+    needs: [prepare-release, deploy-prod]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for Prod EKS
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      # Check 1: Pod Readiness Checks
+      - name: Pod Readiness Checks
+        id: readiness
+        continue-on-error: true
+        run: |
+          kubectl wait --for=condition=ready pod \
+            -l app=${DEPLOYMENT_NAME} \
+            -n ${K8S_NAMESPACE} \
+            --timeout=120s
+
+      # Check 2: Production Smoke Tests
+      - name: Run Production Smoke Tests
+        id: smoke
+        if: steps.readiness.outcome == 'success'
+        continue-on-error: true
+        run: |
+          npm run test:smoke:prod
+
+      # Check 3: Active Monitoring (Amazon CloudWatch Logs, Metrics & Alarms)
+      - name: Check Amazon CloudWatch Alarms
+        id: monitoring
+        if: steps.smoke.outcome == 'success'
+        continue-on-error: true
+        run: |
+          echo "Observing CloudWatch alarms for 60 seconds post-release..."
+          sleep 60
+
+          ALARM_COUNT=$(aws cloudwatch describe-alarms \
+            --alarm-name-prefix "${EKS_CLUSTER_NAME}-${DEPLOYMENT_NAME}" \
+            --state-value ALARM \
+            --query 'length(MetricAlarms)' \
+            --output text)
+
+          if [ "$ALARM_COUNT" -gt 0 ]; then
+            echo "Active CloudWatch alarms detected ($ALARM_COUNT)!"
+            exit 1
+          fi
+          echo "All CloudWatch metrics and alarms are healthy."
+
+      # Evaluate Overall Post-Deployment Health
+      - name: Evaluate Post-Deployment Checks
+        id: checks-gate
+        run: |
+          if [[ "${{ steps.readiness.outcome }}" != "success" || \
+                "${{ steps.smoke.outcome }}" != "success" || \
+                "${{ steps.monitoring.outcome }}" != "success" ]]; then
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Checks Failed -> Rollback Deployment & Update Jira
+      - name: Rollback Production Deployment on Failed Checks
+        if: steps.checks-gate.outputs.passed == 'false'
+        run: |
+          echo "Post-deployment checks failed! Rolling back production..."
+          kubectl rollout undo deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE}
+          kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${K8S_NAMESPACE} --timeout=180s
+
+      - name: Update Jira (Prod Post-Deploy Failed - Hotfix Needed)
+        if: steps.checks-gate.outputs.passed == 'false'
+        uses: your-org/shared-actions/.github/actions/jira-transition@v1
+        with:
+          jira-base-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          source-text: ${{ needs.prepare-release.outputs.jira_issue_key }}
+          target-status: "Prod Deployment Failed"
+
+      - name: Fail Job After Rollback
+        if: steps.checks-gate.outputs.passed == 'false'
+        run: exit 1
+
+      # Checks Passed -> Update Jira (Prod Deployment Success)
+      - name: Update Jira (Prod Deployment Success)
+        if: steps.checks-gate.outputs.passed == 'true'
+        uses: your-org/shared-actions/.github/actions/jira-transition@v1
+        with:
+          jira-base-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          source-text: ${{ needs.prepare-release.outputs.jira_issue_key }}
+          target-status: "Prod Deployment Success"
