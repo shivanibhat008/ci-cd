@@ -16,3 +16,6 @@ configMapGenerator:
   literals:
   - APP_VERSION=backend-v1.3.0-sha-915b450
   name: backend-config
+
+# patches:
+#   - path: ./observability-patch.yaml
