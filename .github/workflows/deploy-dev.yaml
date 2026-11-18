@@ -143,7 +143,7 @@ jobs:
           #echo "Deployment failed health check! Rolling back cluster to previous version..."
           #kubectl rollout undo deployment/${COMPONENT} -n dev
 
-        - name: Deploy to Kubernetes Cluster
+      - name: Deploy to Kubernetes Cluster
         id: deploy
         env:
           COMPONENT: ${{ inputs.component }}
