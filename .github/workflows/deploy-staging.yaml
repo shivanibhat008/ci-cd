@@ -21,4 +21,4 @@ jobs:
           aws eks update-kubeconfig --region eu-west-1 --name ${{ inputs.component_name }}-staging-cluster
           
       - name: Deploy via Kustomize
-        run: kubectl apply -k k8s/overlays/staging}
+        run: kubectl apply -k k8s/overlays/staging
