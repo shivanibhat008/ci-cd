@@ -1,0 +1,24 @@
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # REQUIRED: Allows GitHub to generate the OIDC JWT
+      contents: read    
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/GitHubActions-EKS-Deployment-Role
+          aws-region: eu-west-1
+
+      - name: Generate Kubeconfig
+        run: |
+          # This command uses the temporary IAM Role session to generate the kubeconfig
+          aws eks update-kubeconfig --region eu-west-1 --name ${{ inputs.component_name }}-staging-cluster
+          
+      - name: Deploy via Kustomize
+        run: kubectl apply -k k8s/overlays/staging}
