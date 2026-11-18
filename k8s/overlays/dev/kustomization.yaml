@@ -8,11 +8,8 @@ resources:
 images:
 - name: backend
   newName: bhatshivani/backend
-  newTag: v3.1.0-sha-ed90ec9
+  newTag: v3.0.1-sha-c039461
 configMapGenerator:
 - literals:
-  - APP_VERSION=backend-v3.1.0-sha-ed90ec9
+  - APP_VERSION=backend-v3.0.1-sha-c039461
   name: backend-config
-
-# patches:
-#   - path: ./observability-patch.yaml
