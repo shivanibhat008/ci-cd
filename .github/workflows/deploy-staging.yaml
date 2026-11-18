@@ -3,31 +3,15 @@ name: Deploy to Staging
 on:
   workflow_dispatch:
     inputs:
-      image_tag:
-        description: "Immutable Docker image tag from ECR (e.g., v1.1.0 or commit SHA)"
-        required: true
-        type: string
       jira_issue_key:
         description: "Jira Issue Key (e.g., PROJ-123)"
         required: true
         type: string
-      run_db_migrations:
-        description: "Run DB migration Kubernetes Job before app deployment"
-        required: false
-        type: boolean
-        default: false
   workflow_call:
     inputs:
-      image_tag:
-        required: true
-        type: string
       jira_issue_key:
         required: true
         type: string
-      run_db_migrations:
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   id-token: write   # Required for GitHub OIDC (AWS & HashiCorp Vault)
@@ -36,25 +20,69 @@ permissions:
 env:
   AWS_REGION: us-east-1
   EKS_CLUSTER_NAME: staging-eks-cluster
-  ECR_REPOSITORY: my-app
   K8S_NAMESPACE: staging
-  DEPLOYMENT_NAME: backend
   DB_JOB_NAME: db-migrations
+  DEV_KUSTOMIZE: k8s/overlays/dev/kustomization.yaml
+  STG_KUSTOMIZE: k8s/overlays/staging/kustomization.yaml
 
 jobs:
   # ============================================================
-  # STAGE 5: QA Approval, DB Migration & Staging Deployment
+  # STAGE 4: Detect Changed Components (Dev vs. Staging via yq)
   # ============================================================
-  deploy-staging:
-    name: QA Approval & Deploy to Staging EKS
+  detect-diff:
+    name: Detect Changed Components
     runs-on: ubuntu-latest
-    # Configure 'Required reviewers' (QA Lead) on the 'staging' environment
+    outputs:
+      db_changed: ${{ steps.diff.outputs.db_changed }}
+      db_tag: ${{ steps.diff.outputs.db_tag }}
+      app_components: ${{ steps.diff.outputs.app_components }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compare Dev and Staging Kustomize Overlays
+        id: diff
+        run: |
+          # 1. Check DB Migrations first (Priority)
+          DEV_DB=$(yq '.images[] | select(.name == "*db-migrations*") | .newTag' "$DEV_KUSTOMIZE")
+          STG_DB=$(yq '.images[] | select(.name == "*db-migrations*") | .newTag' "$STG_KUSTOMIZE")
+
+          if [ "$DEV_DB" != "$STG_DB" ] && [ -n "$DEV_DB" ]; then
+            echo "db_changed=true" >> "$GITHUB_OUTPUT"
+            echo "db_tag=$DEV_DB" >> "$GITHUB_OUTPUT"
+            echo "DB Migration changed: ${STG_DB:-none} -> $DEV_DB"
+          else
+            echo "db_changed=false" >> "$GITHUB_OUTPUT"
+            echo "db_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+          # 2. Check Application Components (Backend & Frontend)
+          CHANGED_APPS=()
+          for comp in backend frontend; do
+            DEV_TAG=$(yq ".images[] | select(.name == \"*$comp*\") | .newTag" "$DEV_KUSTOMIZE")
+            STG_TAG=$(yq ".images[] | select(.name == \"*$comp*\") | .newTag" "$STG_KUSTOMIZE")
+
+            if [ "$DEV_TAG" != "$STG_TAG" ] && [ -n "$DEV_TAG" ]; then
+              CHANGED_APPS+=("$comp")
+              echo "$comp changed: ${STG_TAG:-none} -> $DEV_TAG"
+            fi
+          done
+
+          APPS_JSON=$(printf '%s\n' "${CHANGED_APPS[@]}" | jq -R . | jq -s -c 'map(select(length > 0))')
+          echo "Changed app components: $APPS_JSON"
+          echo "app_components=$APPS_JSON" >> "$GITHUB_OUTPUT"
+
+  # ============================================================
+  # STAGE 5A: DB Migration (Runs FIRST - Strict Fix-Forward)
+  # ============================================================
+  deploy-db:
+    name: QA Approval & Run DB Migrations
+    needs: detect-diff
+    if: needs.detect-diff.outputs.db_changed == 'true'
+    runs-on: ubuntu-latest
     environment:
       name: staging
       url: https://example.com
-    outputs:
-      failure_type: ${{ steps.diagnose.outputs.failure_type }}
-      rollback_mode: ${{ steps.diagnose.outputs.rollback_mode }}
 
     steps:
       - name: Checkout repository
@@ -79,90 +107,35 @@ jobs:
         run: |
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
 
-      # ----------------------------------------------------------
-      # 5A. Database Migrations (Runs FIRST - Strict Fix-Forward)
-      # ----------------------------------------------------------
       - name: Run DB Migrations Job
         id: db_migrate
-        if: inputs.run_db_migrations == true
         continue-on-error: true
         run: |
-          echo "Running DB migration Job in ${K8S_NAMESPACE}..."
+          echo "Running DB migration Job (${{ needs.detect-diff.outputs.db_tag }}) in ${K8S_NAMESPACE}..."
           kubectl delete job "${DB_JOB_NAME}" -n "${K8S_NAMESPACE}" --ignore-not-found=true
           kubectl apply -k k8s/overlays/staging/db-migrations
           kubectl wait --for=condition=complete "job/${DB_JOB_NAME}" -n "${K8S_NAMESPACE}" --timeout=180s
 
-      # ----------------------------------------------------------
-      # 5B. Stateless App Deployment (Skipped if DB Migration Failed)
-      # ----------------------------------------------------------
-      - name: Deploy Image to Staging EKS
-        id: deploy
-        if: steps.db_migrate.outcome != 'failure'
-        continue-on-error: true
+      - name: Collect DB Failure Logs
+        if: steps.db_migrate.outcome == 'failure'
         run: |
-          kubectl set image "deployment/${DEPLOYMENT_NAME}" \
-            "${DEPLOYMENT_NAME}=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${{ inputs.image_tag }}" \
-            -n "${K8S_NAMESPACE}"
-
-          kubectl rollout status "deployment/${DEPLOYMENT_NAME}" -n "${K8S_NAMESPACE}" --timeout=300s
-
-      # ----------------------------------------------------------
-      # 5C. Failure Classification, Auto-Calculated Rollback & Logs
-      # ----------------------------------------------------------
-      - name: Classify Failure & Collect Debug Logs
-        id: diagnose
-        if: steps.db_migrate.outcome == 'failure' || steps.deploy.outcome == 'failure'
-        run: |
-          ROLLBACK_MODE="none"
-
-          if [ "${{ steps.db_migrate.outcome }}" == "failure" ]; then
-            FAILURE_TYPE="DB_FAILURE"
-            REASON="DB migration Job failed. App deployment skipped. Halting for Fix-Forward (no DB rollback)."
-          else
-            POD_JSON=$(kubectl get pods -n "$K8S_NAMESPACE" -l "app=$DEPLOYMENT_NAME" --sort-by=.metadata.creationTimestamp -o json | jq '.items[-1]')
-            PHASE=$(echo "$POD_JSON" | jq -r '.status.phase // "Unknown"')
-            WAIT_REASON=$(echo "$POD_JSON" | jq -r '.status.containerStatuses[0].state.waiting.reason // ""')
-            TERM_REASON=$(echo "$POD_JSON" | jq -r '.status.containerStatuses[0].lastState.terminated.reason // ""')
-            READY=$(echo "$POD_JSON" | jq -r '.status.containerStatuses[0].ready // false')
-
-            if [ -z "$POD_JSON" ] || [ "$POD_JSON" == "null" ] \vert{}\vert{} [ "$PHASE" == "Pending" ] || [[ "$WAIT_REASON" =~ ^(ImagePullBackOff\vert{}ErrImagePull\vert{}CreateContainerConfigError\vert{}CreateContainerError)$ ]]; then
-              FAILURE_TYPE="INFRA_FAILURE"
-              REASON="Infrastructure/Cluster issue detected (Phase=$PHASE, Reason=$WAIT_REASON). Rollback skipped."
-            else
-              FAILURE_TYPE="CODE_FAILURE"
-              REASON="Application runtime/probe failure (Phase=$PHASE, Waiting=$WAIT_REASON, Terminated=$TERM_REASON, Ready=$READY)."
-              if [ "${{ inputs.run_db_migrations }}" == "true" ]; then
-                ROLLBACK_MODE="gated"
-              else
-                ROLLBACK_MODE="auto"
-              fi
-            fi
-          fi
-
-          echo "failure_type=$FAILURE_TYPE" >> "$GITHUB_OUTPUT"
-          echo "rollback_mode=$ROLLBACK_MODE" >> "$GITHUB_OUTPUT"
-
           {
-            echo "## Staging Deployment Verdict: \`$FAILURE_TYPE\`"
-            echo "**Calculated Rollback Mode:** \`$ROLLBACK_MODE\`"
-            echo "**Root Cause Signal:** $REASON"
+            echo "## Staging Deployment Verdict: \`DB_FAILURE\`"
+            echo "**Calculated Rollback Mode:** \`none\`"
+            echo "**Root Cause Signal:** DB migration Job failed. App deployment skipped. Halting for Fix-Forward (no DB rollback)."
             echo ""
             echo "### Recent Namespace Events"
             echo '```text'
             kubectl get events -n "$K8S_NAMESPACE" --sort-by='.metadata.creationTimestamp' | tail -n 20 || true
             echo '```'
-            echo "### Recent Logs"
+            echo "### DB Migration Job Logs"
             echo '```text'
-            if [ "$FAILURE_TYPE" == "DB_FAILURE" ]; then
-              kubectl logs "job/${DB_JOB_NAME}" -n "$K8S_NAMESPACE" --tail=100 || true
-            else
-              kubectl logs "deployment/${DEPLOYMENT_NAME}" -n "$K8S_NAMESPACE" --tail=100 --all-containers=true || true
-            fi
+            kubectl logs "job/${DB_JOB_NAME}" -n "$K8S_NAMESPACE" --tail=100 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Update Jira (Staging Deployment Failed)
-        if: steps.db_migrate.outcome == 'failure' || steps.deploy.outcome == 'failure'
+        if: steps.db_migrate.outcome == 'failure'
         uses: ./actions/jira-transition@main
         with:
           jira-base-url: ${{ vars.JIRA_BASE_URL }}
@@ -171,8 +144,131 @@ jobs:
           source-text: ${{ inputs.jira_issue_key }}
           target-status: "Staging Deployment Failed"
 
-      - name: Fail Job on Deployment or DB Failure
-        if: steps.db_migrate.outcome == 'failure' || steps.deploy.outcome == 'failure'
+      - name: Fail Job on DB Migration Failure
+        if: steps.db_migrate.outcome == 'failure'
+        run: exit 1
+
+  # ============================================================
+  # STAGE 5B: Deploy Changed App Components (After DB Migration)
+  # ============================================================
+  deploy-staging:
+    name: QA Approval & Deploy Apps to Staging EKS
+    needs: [detect-diff, deploy-db]
+    if: |
+      always() &&
+      needs.detect-diff.result == 'success' &&
+      (needs.deploy-db.result == 'success' || needs.deploy-db.result == 'skipped') &&
+      needs.detect-diff.outputs.app_components != '[]'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://example.com
+    outputs:
+      failure_type: ${{ steps.diagnose.outputs.failure_type }}
+      rollback_mode: ${{ steps.diagnose.outputs.rollback_mode }}
+      failed_component: ${{ steps.deploy.outputs.failed_component }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Retrieve Secrets from HashiCorp Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ vars.VAULT_ADDR }}
+          method: jwt
+          role: github-actions-staging
+          secrets: |
+            secret/data/staging/app * ;
+
+      - name: Update kubeconfig for Staging EKS
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      - name: Deploy Changed Components to Staging EKS
+        id: deploy
+        continue-on-error: true
+        run: |
+          COMPONENTS=$(echo '${{ needs.detect-diff.outputs.app_components }}' | jq -r '.[]')
+
+          for COMP in $COMPONENTS; do
+            NEW_TAG=$(yq ".images[] | select(.name == \"*$COMP*\") \vert{} .newTag" "$DEV_KUSTOMIZE")
+            IMAGE_NAME=$(yq ".images[] | select(.name == \"*$COMP*\") \vert{} .name" "$DEV_KUSTOMIZE")
+
+            echo "Deploying ${COMP} with image ${IMAGE_NAME}:${NEW_TAG}..."
+            kubectl set image "deployment/${COMP}" \
+              "${COMP}=${IMAGE_NAME}:${NEW_TAG}" \
+              -n "${K8S_NAMESPACE}"
+
+            if ! kubectl rollout status "deployment/${COMP}" -n "${K8S_NAMESPACE}" --timeout=300s; then
+              echo "failed_component=${COMP}" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          done
+
+      - name: Classify Failure & Collect Debug Logs
+        id: diagnose
+        if: steps.deploy.outcome == 'failure'
+        run: |
+          ROLLBACK_MODE="none"
+          FAILED_COMP="${{ steps.deploy.outputs.failed_component }}"
+
+          POD_JSON=$(kubectl get pods -n "$K8S_NAMESPACE" -l "app=$FAILED_COMP" --sort-by=.metadata.creationTimestamp -o json | jq '.items[-1]')
+          PHASE=$(echo "$POD_JSON" | jq -r '.status.phase // "Unknown"')
+          WAIT_REASON=$(echo "$POD_JSON" | jq -r '.status.containerStatuses[0].state.waiting.reason // ""')
+          TERM_REASON=$(echo "$POD_JSON" | jq -r '.status.containerStatuses[0].lastState.terminated.reason // ""')
+          READY=$(echo "$POD_JSON" | jq -r '.status.containerStatuses[0].ready // false')
+
+          if [ -z "$POD_JSON" ] || [ "$POD_JSON" == "null" ] \vert{}\vert{} [ "$PHASE" == "Pending" ] || [[ "$WAIT_REASON" =~ ^(ImagePullBackOff\vert{}ErrImagePull\vert{}CreateContainerConfigError\vert{}CreateContainerError)$ ]]; then
+            FAILURE_TYPE="INFRA_FAILURE"
+            REASON="Infrastructure/Cluster issue detected on ${FAILED_COMP} (Phase=$PHASE, Reason=$WAIT_REASON). Rollback skipped."
+          else
+            FAILURE_TYPE="CODE_FAILURE"
+            REASON="Application runtime/probe failure on ${FAILED_COMP} (Phase=$PHASE, Waiting=$WAIT_REASON, Terminated=$TERM_REASON, Ready=$READY)."
+            if [ "${{ needs.detect-diff.outputs.db_changed }}" == "true" ]; then
+              ROLLBACK_MODE="gated"
+            else
+              ROLLBACK_MODE="auto"
+            fi
+          fi
+
+          echo "failure_type=$FAILURE_TYPE" >> "$GITHUB_OUTPUT"
+          echo "rollback_mode=$ROLLBACK_MODE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Staging Deployment Verdict: \`$FAILURE_TYPE\`"
+            echo "**Failed Component:** \`$FAILED_COMP\`"
+            echo "**Calculated Rollback Mode:** \`$ROLLBACK_MODE\`"
+            echo "**Root Cause Signal:** $REASON"
+            echo ""
+            echo "### Recent Namespace Events"
+            echo '```text'
+            kubectl get events -n "$K8S_NAMESPACE" --sort-by='.metadata.creationTimestamp' | tail -n 20 || true
+            echo '```'
+            echo "### Recent Logs (${FAILED_COMP})"
+            echo '```text'
+            kubectl logs "deployment/${FAILED_COMP}" -n "$K8S_NAMESPACE" --tail=100 --all-containers=true || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update Jira (Staging Deployment Failed)
+        if: steps.deploy.outcome == 'failure'
+        uses: ./actions/jira-transition@main
+        with:
+          jira-base-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+          source-text: ${{ inputs.jira_issue_key }}
+          target-status: "Staging Deployment Failed"
+
+      - name: Fail Job on Deployment Failure
+        if: steps.deploy.outcome == 'failure'
         run: exit 1
 
       - name: Update Jira (Staging Deployment Success)
@@ -190,7 +286,12 @@ jobs:
   # ============================================================
   staging-tests:
     name: Run Staging Test Suite
-    needs: deploy-staging
+    needs: [detect-diff, deploy-db, deploy-staging]
+    if: |
+      always() &&
+      needs.detect-diff.result == 'success' &&
+      (needs.deploy-db.result == 'success' || needs.deploy-db.result == 'skipped') &&
+      (needs.deploy-staging.result == 'success' || (needs.deploy-staging.result == 'skipped' && needs.deploy-db.result == 'success'))
     runs-on: ubuntu-latest
     outputs:
       rollback_mode: ${{ steps.test-gate.outputs.rollback_mode }}
@@ -297,16 +398,17 @@ jobs:
       - name: Promote to Prod (Prepare Release)
         if: steps.test-gate.outputs.passed == 'true'
         run: |
-          echo "Image ${{ inputs.image_tag }} verified in Staging and ready for Production release tag."
+          echo "Verified components (${{ needs.detect-diff.outputs.app_components }}) in Staging and ready for Production release."
 
   # ============================================================
   # ROLLBACK PATH A: Auto Rollback (Stateless App Code Failure Only)
   # ============================================================
   auto-rollback-staging:
     name: Auto Rollback Staging EKS
-    needs: [deploy-staging, staging-tests]
+    needs: [detect-diff, deploy-staging, staging-tests]
     if: |
       always() &&
+      needs.detect-diff.outputs.app_components != '[]' &&
       (needs.deploy-staging.outputs.rollback_mode == 'auto' || needs.staging-tests.outputs.rollback_mode == 'auto')
     runs-on: ubuntu-latest
 
@@ -322,11 +424,15 @@ jobs:
 
       - name: Execute Immediate App Rollback
         run: |
-          echo "Executing Auto-Rollback for deployment/${DEPLOYMENT_NAME}..."
           echo "NOTE: DB migrations are NOT rolled back (Expand/Contract compatibility assumed)."
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
-          kubectl rollout undo "deployment/${DEPLOYMENT_NAME}" -n "${K8S_NAMESPACE}"
-          kubectl rollout status "deployment/${DEPLOYMENT_NAME}" -n "${K8S_NAMESPACE}" --timeout=180s
+
+          COMPONENTS=$(echo '${{ needs.detect-diff.outputs.app_components }}' | jq -r '.[]')
+          for COMP in $COMPONENTS; do
+            echo "Executing Auto-Rollback for deployment/${COMP}..."
+            kubectl rollout undo "deployment/${COMP}" -n "${K8S_NAMESPACE}"
+            kubectl rollout status "deployment/${COMP}" -n "${K8S_NAMESPACE}" --timeout=180s
+          done
 
       - name: Update Jira (Staging Rolled Back)
         uses: ./actions/jira-transition@main
@@ -342,12 +448,12 @@ jobs:
   # ============================================================
   gated-rollback-staging:
     name: Gated Rollback Staging EKS (Approval Required)
-    needs: [deploy-staging, staging-tests]
+    needs: [detect-diff, deploy-staging, staging-tests]
     if: |
       always() &&
+      needs.detect-diff.outputs.app_components != '[]' &&
       (needs.deploy-staging.outputs.rollback_mode == 'gated' || needs.staging-tests.outputs.rollback_mode == 'gated')
     runs-on: ubuntu-latest
-    # Configure 'Required reviewers' on 'staging-rollback' environment to gate the rollback
     environment:
       name: staging-rollback
 
@@ -363,11 +469,15 @@ jobs:
 
       - name: Execute Approved App Rollback
         run: |
-          echo "Human approval granted. Rolling back deployment/${DEPLOYMENT_NAME}..."
-          echo "NOTE: DB migrations are NOT rolled back (Expand/Contract compatibility assumed)."
+          echo "Human approval granted. NOTE: DB migrations are NOT rolled back (Expand/Contract compatibility assumed)."
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
-          kubectl rollout undo "deployment/${DEPLOYMENT_NAME}" -n "${K8S_NAMESPACE}"
-          kubectl rollout status "deployment/${DEPLOYMENT_NAME}" -n "${K8S_NAMESPACE}" --timeout=180s
+
+          COMPONENTS=$(echo '${{ needs.detect-diff.outputs.app_components }}' | jq -r '.[]')
+          for COMP in $COMPONENTS; do
+            echo "Rolling back deployment/${COMP}..."
+            kubectl rollout undo "deployment/${COMP}" -n "${K8S_NAMESPACE}"
+            kubectl rollout status "deployment/${COMP}" -n "${K8S_NAMESPACE}" --timeout=180s
+          done
 
       - name: Update Jira (Staging Rolled Back)
         uses: ./actions/jira-transition@main
