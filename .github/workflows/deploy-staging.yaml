@@ -19,6 +19,7 @@ jobs:
         run: |
           # This command uses the temporary IAM Role session to generate the kubeconfig
           aws eks update-kubeconfig --region eu-west-1 --name ${{ inputs.component_name }}-staging-cluster
+        
           
       - name: Deploy via Kustomize
         run: kubectl apply -k k8s/overlays/staging
