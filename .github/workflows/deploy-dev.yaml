@@ -29,7 +29,7 @@ jobs:
     steps:
       - name: Generate CD Repo Token
         id: cd-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@main
         with:
           app-id: ${{ secrets.CI_APP_ID }}
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
@@ -181,4 +181,30 @@ jobs:
       #     } >> "$GITHUB_STEP_SUMMARY"
 
       #     exit 1
+
+            # ============================================================
+      # JIRA UPDATE: DEPLOYMENT SUCCEEDED
+      # ============================================================
+      # - name: Update Jira Ticket (Dev Deployment Success)
+      #   if: success()
+      #   uses: ./.github/actions/jira-transition@main
+      #   with:
+      #     jira-base-url: ${{ inputs.jira_base_url }}
+      #     jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+      #     jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+      #     source-text: ${{ inputs.jira_issue_key }}
+      #     target-status: "Dev Deployment Success"
+
+      # # ============================================================
+      # # JIRA UPDATE & FAILURE HANDLING: DEPLOYMENT FAILED
+      # # ============================================================
+      # - name: Update Jira Ticket (Dev Deployment Failed)
+      #   if: failure() || cancelled()
+      #   uses: ./.github/actions/jira-transition@main
+      #   with:
+      #     jira-base-url: ${{ inputs.jira_base_url }}
+      #     jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+      #     jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+      #     source-text: ${{ inputs.jira_issue_key }}
+      #     target-status: "Dev Deployment Failed"
           
