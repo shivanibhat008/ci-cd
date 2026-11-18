@@ -139,4 +139,46 @@ jobs:
         #run: |
           #echo "Deployment failed health check! Rolling back cluster to previous version..."
           #kubectl rollout undo deployment/${COMPONENT} -n dev
+
+      # - name: Fix-Forward Diagnostics & Cleanup (No Rollback)
+      #   if: failure() || cancelled()
+      #   env:
+      #     COMPONENT: ${{ inputs.component }}
+      #   run: |
+      #     if [ "$COMPONENT" == "db-migrations" ]; then
+      #       FAILURE_TYPE="DB_FAILURE"
+      #       ACTION="DB migration Job failed. Fix the SQL script and push a new commit (Fix-Forward)."
+      #     else
+      #       POD_JSON=$(kubectl get pods -n dev -l "app=$COMPONENT" --sort-by=.metadata.creationTimestamp -o json | jq '.items[-1]')
+      #       PHASE=$(echo "$POD_JSON" | jq -r '.status.phase // "Unknown"')
+      #       WAIT_REASON=$(echo "$POD_JSON" | jq -r '.status.containerStatuses[0].state.waiting.reason // ""')
+
+      #       if [ -z "$POD_JSON" ] || [ "$POD_JSON" == "null" ] || [ "$PHASE" == "Pending" ] || [[ "$WAIT_REASON" =~ ^(ImagePullBackOff|ErrImagePull|CreateContainerConfigError|CreateContainerError)$ ]]; then
+      #         FAILURE_TYPE="INFRA_FAILURE"
+      #         ACTION="Cluster/Infra issue ($PHASE / $WAIT_REASON). Fix cluster resources, IAM, or registry access."
+      #       else
+      #         FAILURE_TYPE="CODE_FAILURE"
+      #         ACTION="App runtime/probe failure. Pods left active in dev for debugging—push a fix-forward commit."
+      #       fi
+      #     fi
+
+      #     {
+      #       echo "## Dev Deployment Failed: \`$FAILURE_TYPE\` (Fix-Forward Policy)"
+      #       echo "**Component:** \`$COMPONENT\` | **Next Step:** $ACTION"
+      #       echo ""
+      #       echo "### Recent Dev Events"
+      #       echo '```text'
+      #       kubectl get events -n dev --sort-by='.metadata.creationTimestamp' | tail -n 20 || true
+      #       echo '```'
+      #       echo "### Recent Logs"
+      #       echo '```text'
+      #       if [ "$COMPONENT" == "db-migrations" ]; then
+      #         kubectl logs job/db-migrations -n dev --tail=100 || true
+      #       else
+      #         kubectl logs "deployment/${COMPONENT}" -n dev --tail=100 --all-containers=true || true
+      #       fi
+      #       echo '```'
+      #     } >> "$GITHUB_STEP_SUMMARY"
+
+      #     exit 1
           
