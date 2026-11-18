@@ -83,6 +83,39 @@ jobs:
           
       #     kubectl rollout status deployment/${{ inputs.component }} -n dev --timeout=90s
 
+      # ============================================================
+      # KUBERNETES DIAGNOSTICS (Runs on both success and failure)
+      # ============================================================
+      # - name: Collect Kubernetes Diagnostics
+      #   if: always()
+      #   env:
+      #     COMPONENT: ${{ inputs.component }}
+      #     NAMESPACE: dev
+      #   run: |
+      #     {
+      #       echo "## Kubernetes Diagnostics (${COMPONENT} in \`${NAMESPACE}\`)"
+
+      #       echo "### 1. Current Pod Status"
+      #       echo '```'
+      #       kubectl get pods -n "\${NAMESPACE}" -o wide || true
+      #       echo '```'
+
+      #       echo "### 2. Last 25 Namespace Events"
+      #       echo '```'
+      #       kubectl get events -n "\${NAMESPACE}" --sort-by='.lastTimestamp' | tail -n 25 || true
+      #       echo '```'
+
+      #       echo "### 3. Last 100 Lines of Container Logs"
+      #       echo '```'
+      #       kubectl logs deployment/"COMPONENT" -n "{NAMESPACE}" --all-containers=true --tail=100 || true
+      #       echo '```'
+
+      #       echo "### 4. Full Workload Description (Probes & Mounts)"
+      #       echo '```'
+      #       kubectl describe deployment/"COMPONENT" -n "{NAMESPACE}" || true
+      #       echo '```'
+      #     } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Commit and Push Changes
         if: steps.update_kustomize_manifest.outcome == 'success'
         env:
