@@ -1,0 +1,42 @@
+name: "Transition Jira Ticket & Fetch Fix Version"
+description: "Extracts a Jira issue key, fetches its Fix Version, and moves the ticket to a target status."
+
+inputs:
+  jira-base-url:
+    description: "Your Jira instance URL (e.g., https://your-domain.atlassian.net)"
+    required: true
+  jira-user-email:
+    description: "Email address of the Jira service account"
+    required: true
+  jira-api-token:
+    description: "Atlassian API token"
+    required: true
+  source-text:
+    description: "Text containing the Jira issue key (e.g., PR title or branch name)"
+    required: true
+  target-status:
+    description: "Target workflow state name (e.g., In Review, In Progress, Done)"
+    required: false
+    default: ""
+
+outputs:
+  issue-key:
+    description: "The extracted Jira issue key"
+    value: ${{ steps.jira-sync.outputs.key }}
+  fix-version:
+    description: "The primary Fix Version assigned to the Jira ticket"
+    value: ${{ steps.jira-sync.outputs.fix-version }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run Jira Automation Script
+      id: jira-sync
+      shell: bash
+      env:
+        JIRA_BASE_URL: ${{ inputs.jira-base-url }}
+        JIRA_EMAIL: ${{ inputs.jira-user-email }}
+        JIRA_TOKEN: ${{ inputs.jira-api-token }}
+        SOURCE_TEXT: ${{ inputs.source-text }}
+        TARGET_STATUS: ${{ inputs.target-status }}
+      run: python3 "${{ github.action_path }}/jira_helper.py"

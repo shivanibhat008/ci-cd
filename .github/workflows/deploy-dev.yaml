@@ -72,6 +72,52 @@ jobs:
           
           #echo "--- VERIFYING GENERATED KUSTOMIZE MANIFEST ---"
           #kustomize build .
+          
+          #echo "--- VERIFYING GENERATED KUSTOMIZE MANIFEST ---"
+          #kustomize build .
+
+      # - name: Deploy to Kubernetes Cluster
+      #   id: deploy
+      #   run: |
+      #     kubectl apply -k k8s/overlays/dev
+          
+      #     echo "--- VERIFYING LIVE CONFIGMAP IN CLUSTER ---"
+      #     kubectl get configmap ${{ inputs.component }}-config -n dev -o yaml
+          
+      #     kubectl rollout status deployment/${{ inputs.component }} -n dev --timeout=90s
+
+      # ============================================================
+      # KUBERNETES DIAGNOSTICS (Runs on both success and failure)
+      # ============================================================
+      # - name: Collect Kubernetes Diagnostics
+      #   if: always()
+      #   env:
+      #     COMPONENT: ${{ inputs.component }}
+      #     NAMESPACE: dev
+      #   run: |
+      #     {
+      #       echo "## Kubernetes Diagnostics (${COMPONENT} in \`${NAMESPACE}\`)"
+
+      #       echo "### 1. Current Pod Status"
+      #       echo '```'
+      #       kubectl get pods -n "\${NAMESPACE}" -o wide || true
+      #       echo '```'
+
+      #       echo "### 2. Last 25 Namespace Events"
+      #       echo '```'
+      #       kubectl get events -n "\${NAMESPACE}" --sort-by='.lastTimestamp' | tail -n 25 || true
+      #       echo '```'
+
+      #       echo "### 3. Last 100 Lines of Container Logs"
+      #       echo '```'
+      #       kubectl logs deployment/"COMPONENT" -n "{NAMESPACE}" --all-containers=true --tail=100 || true
+      #       echo '```'
+
+      #       echo "### 4. Full Workload Description (Probes & Mounts)"
+      #       echo '```'
+      #       kubectl describe deployment/"COMPONENT" -n "{NAMESPACE}" || true
+      #       echo '```'
+      #     } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Commit and Push Changes
         if: steps.update_kustomize_manifest.outcome == 'success'
@@ -86,10 +132,10 @@ jobs:
           git push origin main
           # Add PR to make the push
 
-      - name: Rollback on failure
+      - name: Deploymnet failed
         if: always() && (steps.update_kustomize_manifest.outcome == 'failure' || steps.update_kustomize_manifest.outcome == 'cancelled')
         run: |
-          echo "Deployment failed health check! Rolling back cluster to previous version..."
+          echo "Deployment failed. Fix forward and redeploy..."
           exit 1
           #env:
           #COMPONENT: ${{ github.event.client_payload.component }}
@@ -169,4 +215,30 @@ jobs:
       #     } >> "$GITHUB_STEP_SUMMARY"
 
       #     exit 1
+
+            # ============================================================
+      # JIRA UPDATE: DEPLOYMENT SUCCEEDED
+      # ============================================================
+      # - name: Update Jira Ticket (Dev Deployment Success)
+      #   if: success()
+      #   uses: ./.github/actions/jira-transition@main
+      #   with:
+      #     jira-base-url: ${{ inputs.jira_base_url }}
+      #     jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+      #     jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+      #     source-text: ${{ inputs.jira_issue_key }}
+      #     target-status: "Dev Deployment Success"
+
+      # # ============================================================
+      # # JIRA UPDATE & FAILURE HANDLING: DEPLOYMENT FAILED
+      # # ============================================================
+      # - name: Update Jira Ticket (Dev Deployment Failed)
+      #   if: failure() || cancelled()
+      #   uses: ./.github/actions/jira-transition@main
+      #   with:
+      #     jira-base-url: ${{ inputs.jira_base_url }}
+      #     jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
+      #     jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
+      #     source-text: ${{ inputs.jira_issue_key }}
+      #     target-status: "Dev Deployment Failed"
           
