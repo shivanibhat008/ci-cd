@@ -3,6 +3,8 @@ kind: Kustomization
 namespace: dev
 resources:
 - ../../base/backend
+- ../../base/db-migration
+- ../../base/frontend
 # The GitHub Actions pipeline will dynamically overwrite 
 # 'YOUR-DOCKER-USERNAME' and 'LATEST-TAG' during the CD run.
 images:
