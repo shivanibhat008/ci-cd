@@ -7,10 +7,37 @@ on:
         description: "Jira Issue Key (e.g., PROJ-123)"
         required: true
         type: string
+      deployment_type:
+        description: "Normal Staging promotion or isolated Hotfix"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - hotfix
+      hotfix_component:
+        description: "Hotfix only: component to deploy (backend, frontend, or db-migrations)"
+        required: false
+        type: string
+      hotfix_tag:
+        description: "Hotfix only: full image tag from my-app-code (e.g., v1.0.1-sha-a1b2c3d)"
+        required: false
+        type: string
+
   workflow_call:
     inputs:
       jira_issue_key:
         required: true
+        type: string
+      deployment_type:
+        required: false
+        default: "staging"
+        type: string
+      hotfix_component:
+        required: false
+        type: string
+      hotfix_tag:
+        required: false
         type: string
 
 permissions:
@@ -20,14 +47,16 @@ permissions:
 env:
   AWS_REGION: us-east-1
   EKS_CLUSTER_NAME: staging-eks-cluster
-  K8S_NAMESPACE: staging
+  # Dynamically routes to the isolated 'hotfix' namespace on the same Staging EKS cluster
+  K8S_NAMESPACE: ${{ inputs.deployment_type == 'hotfix' && 'hotfix' || 'staging' }}
+  KUSTOMIZE_DIR: ${{ inputs.deployment_type == 'hotfix' && 'k8s/overlays/hotfix' || 'k8s/overlays/staging' }}
   DB_JOB_NAME: db-migrations
   DEV_KUSTOMIZE: k8s/overlays/dev/kustomization.yaml
   STG_KUSTOMIZE: k8s/overlays/staging/kustomization.yaml
 
 jobs:
   # ============================================================
-  # STAGE 4: Detect Changed Components (Dev vs. Staging via yq)
+  # STAGE 4: Detect Changed Components (Dev vs. Staging or Hotfix)
   # ============================================================
   detect-diff:
     name: Detect Changed Components
@@ -42,15 +71,41 @@ jobs:
 
       - name: Compare Dev and Staging Kustomize Overlays
         id: diff
+        env:
+          DEPLOY_TYPE: ${{ inputs.deployment_type }}
+          HOTFIX_COMP: ${{ inputs.hotfix_component }}
+          HOTFIX_TAG: ${{ inputs.hotfix_tag }}
         run: |
+          # Hotfix path: skip Dev-vs-Staging diff and use explicit hotfix inputs
+          if [ "$DEPLOY_TYPE" == "hotfix" ]; then
+            if [ -z "$HOTFIX_COMP" ] \vert{}\vert{} [ -z "$HOTFIX_TAG" ]; then
+              echo "Error: hotfix_component and hotfix_tag are required when deployment_type is 'hotfix'."
+              exit 1
+            fi
+
+            if [ "$HOTFIX_COMP" == "db-migrations" ]; then
+              echo "db_changed=true" >> "$GITHUB_OUTPUT"
+              echo "db_tag=$HOTFIX_TAG" >> "$GITHUB_OUTPUT"
+              echo "app_components=[]" >> "$GITHUB_OUTPUT"
+              echo "Hotfix DB Migration: $HOTFIX_TAG -> namespace '${K8S_NAMESPACE}'"
+            else
+              echo "db_changed=false" >> "$GITHUB_OUTPUT"
+              echo "db_tag=" >> "$GITHUB_OUTPUT"
+              echo "app_components=[\"$HOTFIX_COMP\"]" >> "$GITHUB_OUTPUT"
+              echo "Hotfix App Component: $HOTFIX_COMP ($HOTFIX_TAG) -> namespace '${K8S_NAMESPACE}'"
+            fi
+            exit 0
+          fi
+
+          # Normal Staging path:
           # 1. Check DB Migrations first (Priority)
-          DEV_DB=$(yq '.images[] | select(.name == "*db-migrations*") | .newTag' "$DEV_KUSTOMIZE")
-          STG_DB=$(yq '.images[] | select(.name == "*db-migrations*") | .newTag' "$STG_KUSTOMIZE")
+          DEV_DB=$(yq '.images[] \vert{} select(.name == "*db-migrations*") \vert{} .newTag' "$DEV_KUSTOMIZE")
+          STG_DB=$(yq '.images[] \vert{} select(.name == "*db-migrations*") \vert{} .newTag' "$STG_KUSTOMIZE")
 
           if [ "$DEV_DB" != "$STG_DB" ] && [ -n "$DEV_DB" ]; then
             echo "db_changed=true" >> "$GITHUB_OUTPUT"
             echo "db_tag=$DEV_DB" >> "$GITHUB_OUTPUT"
-            echo "DB Migration changed: ${STG_DB:-none} -> $DEV_DB"
+            echo "DB Migration changed: ${STG_DB:-none} ->$DEV_DB"
           else
             echo "db_changed=false" >> "$GITHUB_OUTPUT"
             echo "db_tag=" >> "$GITHUB_OUTPUT"
@@ -59,16 +114,16 @@ jobs:
           # 2. Check Application Components (Backend & Frontend)
           CHANGED_APPS=()
           for comp in backend frontend; do
-            DEV_TAG=$(yq ".images[] | select(.name == \"*$comp*\") | .newTag" "$DEV_KUSTOMIZE")
-            STG_TAG=$(yq ".images[] | select(.name == \"*$comp*\") | .newTag" "$STG_KUSTOMIZE")
+            DEV_TAG=$(yq ".images[] | select(.name == \"*$comp*\") \vert{} .newTag" "$DEV_KUSTOMIZE")
+            STG_TAG=$(yq ".images[] | select(.name == \"*$comp*\") \vert{} .newTag" "$STG_KUSTOMIZE")
 
             if [ "$DEV_TAG" != "$STG_TAG" ] && [ -n "$DEV_TAG" ]; then
               CHANGED_APPS+=("$comp")
-              echo "$comp changed: ${STG_TAG:-none} -> $DEV_TAG"
+              echo "$comp changed: ${STG_TAG:-none} ->$DEV_TAG"
             fi
           done
 
-          APPS_JSON=$(printf '%s\n' "${CHANGED_APPS[@]}" | jq -R . | jq -s -c 'map(select(length > 0))')
+          APPS_JSON=$(printf '\%s\n' "${CHANGED_APPS[@]}" | jq -R . | jq -s -c 'map(select(length > 0))')
           echo "Changed app components: $APPS_JSON"
           echo "app_components=$APPS_JSON" >> "$GITHUB_OUTPUT"
 
@@ -107,13 +162,24 @@ jobs:
         run: |
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
 
+      - name: Update Hotfix DB Migration Manifest
+        if: inputs.deployment_type == 'hotfix'
+        env:
+          FULL_TAG: ${{ inputs.hotfix_tag }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          echo "Updating Hotfix DB Migration overlay with tag: $FULL_TAG"
+          cd "${KUSTOMIZE_DIR}/db-migrations"
+          kustomize edit set image db-migrations="${DOCKERHUB_USER}/db-migrations:${FULL_TAG}"
+
       - name: Run DB Migrations Job
         id: db_migrate
         continue-on-error: true
         run: |
-          echo "Running DB migration Job (${{ needs.detect-diff.outputs.db_tag }}) in ${K8S_NAMESPACE}..."
+          echo "Running DB migration Job (${{ needs.detect-diff.outputs.db_tag }}) in${K8S_NAMESPACE}..."
+          kubectl create namespace "${K8S_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
           kubectl delete job "${DB_JOB_NAME}" -n "${K8S_NAMESPACE}" --ignore-not-found=true
-          kubectl apply -k k8s/overlays/staging/db-migrations
+          kubectl apply -k "${KUSTOMIZE_DIR}/db-migrations"
           kubectl wait --for=condition=complete "job/${DB_JOB_NAME}" -n "${K8S_NAMESPACE}" --timeout=180s
 
       - name: Collect DB Failure Logs
@@ -121,6 +187,7 @@ jobs:
         run: |
           {
             echo "## Staging Deployment Verdict: \`DB_FAILURE\`"
+            echo "**Namespace:** \`$K8S_NAMESPACE\`"
             echo "**Calculated Rollback Mode:** \`none\`"
             echo "**Root Cause Signal:** DB migration Job failed. App deployment skipped. Halting for Fix-Forward (no DB rollback)."
             echo ""
@@ -155,7 +222,7 @@ jobs:
     name: QA Approval & Deploy Apps to Staging EKS
     needs: [detect-diff, deploy-db]
     if: |
-      always() &&
+      !cancelled() &&
       needs.detect-diff.result == 'success' &&
       (needs.deploy-db.result == 'success' || needs.deploy-db.result == 'skipped') &&
       needs.detect-diff.outputs.app_components != '[]'
@@ -191,26 +258,61 @@ jobs:
         run: |
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
 
+      # Hotfix only: update k8s/overlays/hotfix using the same Kustomize pattern as Dev
+      - name: Update Hotfix Kustomize Manifests
+        id: update_kustomize_manifest
+        if: inputs.deployment_type == 'hotfix'
+        env:
+          COMPONENT: ${{ inputs.hotfix_component }}
+          FULL_TAG: ${{ inputs.hotfix_tag }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          echo "Updating Hotfix overlay for $COMPONENT with tag:$FULL_TAG"
+          cd "${KUSTOMIZE_DIR}"
+
+          # 1. Set the new image
+          kustomize edit set image "${COMPONENT}=${DOCKERHUB_USER}/${COMPONENT}:${FULL_TAG}"
+
+          # 2. Safely delete old ConfigMap generation
+          yq -i 'del(.configMapGenerator[] | select(.name == "'"${COMPONENT}"'-config"))' kustomization.yaml || true
+
+          # 3. Add new ConfigMap generation
+          kustomize edit add configmap "${COMPONENT}-config" --from-literal=APP_VERSION="${COMPONENT}-${FULL_TAG}"
+
       - name: Deploy Changed Components to Staging EKS
         id: deploy
         continue-on-error: true
+        env:
+          DEPLOY_TYPE: ${{ inputs.deployment_type }}
+          HOTFIX_COMP: ${{ inputs.hotfix_component }}
         run: |
-          COMPONENTS=$(echo '${{ needs.detect-diff.outputs.app_components }}' | jq -r '.[]')
+          if [ "$DEPLOY_TYPE" == "hotfix" ]; then
+            echo "Deploying hotfix (${HOTFIX_COMP}) into isolated namespace '${K8S_NAMESPACE}'..."
+            kubectl create namespace "${K8S_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+            kubectl apply -k "${KUSTOMIZE_DIR}"
 
-          for COMP in $COMPONENTS; do
-            NEW_TAG=$(yq ".images[] | select(.name == \"*$COMP*\") \vert{} .newTag" "$DEV_KUSTOMIZE")
-            IMAGE_NAME=$(yq ".images[] | select(.name == \"*$COMP*\") \vert{} .name" "$DEV_KUSTOMIZE")
-
-            echo "Deploying ${COMP} with image ${IMAGE_NAME}:${NEW_TAG}..."
-            kubectl set image "deployment/${COMP}" \
-              "${COMP}=${IMAGE_NAME}:${NEW_TAG}" \
-              -n "${K8S_NAMESPACE}"
-
-            if ! kubectl rollout status "deployment/${COMP}" -n "${K8S_NAMESPACE}" --timeout=300s; then
-              echo "failed_component=${COMP}" >> "$GITHUB_OUTPUT"
+            if ! kubectl rollout status "deployment/${HOTFIX_COMP}" -n "${K8S_NAMESPACE}" --timeout=300s; then
+              echo "failed_component=${HOTFIX_COMP}" >> "$GITHUB_OUTPUT"
               exit 1
             fi
-          done
+          else
+            COMPONENTS=$(echo '${{ needs.detect-diff.outputs.app_components }}' | jq -r '.[]')
+
+            for COMP in $COMPONENTS; do
+              NEW_TAG=$(yq ".images[] | select(.name == \"*$COMP*\") \vert{} .newTag" "$DEV_KUSTOMIZE")
+              IMAGE_NAME=$(yq ".images[] | select(.name == \"*$COMP*\") \vert{} .name" "$DEV_KUSTOMIZE")
+
+              echo "Deploying ${COMP} with image${IMAGE_NAME}:${NEW_TAG} to namespace '${K8S_NAMESPACE}'..."
+              kubectl set image "deployment/${COMP}" \
+                "${COMP}=${IMAGE_NAME}:${NEW_TAG}" \
+                -n "${K8S_NAMESPACE}"
+
+              if ! kubectl rollout status "deployment/${COMP}" -n "${K8S_NAMESPACE}" --timeout=300s; then
+                echo "failed_component=${COMP}" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+            done
+          fi
 
       - name: Classify Failure & Collect Debug Logs
         id: diagnose
@@ -243,6 +345,7 @@ jobs:
 
           {
             echo "## Staging Deployment Verdict: \`$FAILURE_TYPE\`"
+            echo "**Namespace:** \`$K8S_NAMESPACE\`"
             echo "**Failed Component:** \`$FAILED_COMP\`"
             echo "**Calculated Rollback Mode:** \`$ROLLBACK_MODE\`"
             echo "**Root Cause Signal:** $REASON"
@@ -288,7 +391,7 @@ jobs:
     name: Run Staging Test Suite
     needs: [detect-diff, deploy-db, deploy-staging]
     if: |
-      always() &&
+      !cancelled() &&
       needs.detect-diff.result == 'success' &&
       (needs.deploy-db.result == 'success' || needs.deploy-db.result == 'skipped') &&
       (needs.deploy-staging.result == 'success' || (needs.deploy-staging.result == 'skipped' && needs.deploy-db.result == 'success'))
@@ -310,7 +413,7 @@ jobs:
         run: |
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
 
-      # Tier 1: Critical Path Tests (With Retries to Filter Flakes)
+      # Tier 1: Critical Path Tests (Runs for both Staging and Hotfix)
       - name: Run Integration Tests (Tier 1 - With Retries)
         id: integration
         continue-on-error: true
@@ -334,22 +437,22 @@ jobs:
           done
           exit 1
 
-      # Tier 2: Full Suite (Rerun Tests First; Do Not Auto-Rollback Cluster)
+      # Tier 2: Full Suite (Skipped for Hotfix to keep MTTR fast)
       - name: Run E2E Tests (Tier 2)
         id: e2e
-        if: steps.smoke.outcome == 'success'
+        if: steps.smoke.outcome == 'success' && inputs.deployment_type != 'hotfix'
         continue-on-error: true
         run: npm run test:e2e
 
       - name: Run Performance Tests (Tier 2)
         id: perf
-        if: steps.e2e.outcome == 'success'
+        if: steps.e2e.outcome == 'success' && inputs.deployment_type != 'hotfix'
         continue-on-error: true
         run: npm run test:performance
 
       - name: Run Regression Tests (Tier 2)
         id: regression
-        if: steps.perf.outcome == 'success'
+        if: steps.perf.outcome == 'success' && inputs.deployment_type != 'hotfix'
         continue-on-error: true
         run: npm run test:regression
 
@@ -359,7 +462,7 @@ jobs:
           if [[ "${{ steps.integration.outcome }}" == "failure" || "${{ steps.smoke.outcome }}" == "failure" ]]; then
             echo "passed=false" >> "$GITHUB_OUTPUT"
             echo "rollback_mode=gated" >> "$GITHUB_OUTPUT"
-            echo "## Staging Tests Failed (Tier 1 Deterministic)" >> "$GITHUB_STEP_SUMMARY"
+            echo "## Staging Tests Failed (Tier 1 Deterministic - Namespace: \`$K8S_NAMESPACE\`)" >> "$GITHUB_STEP_SUMMARY"
             echo "Critical Integration/Smoke tests failed after 3 attempts. Routing to **gated** rollback." >> "$GITHUB_STEP_SUMMARY"
           elif [[ "${{ steps.e2e.outcome }}" == "failure" || "${{ steps.perf.outcome }}" == "failure" || "${{ steps.regression.outcome }}" == "failure" ]]; then
             echo "passed=false" >> "$GITHUB_OUTPUT"
@@ -398,7 +501,7 @@ jobs:
       - name: Promote to Prod (Prepare Release)
         if: steps.test-gate.outputs.passed == 'true'
         run: |
-          echo "Verified components (${{ needs.detect-diff.outputs.app_components }}) in Staging and ready for Production release."
+          echo "Verified components (${{ needs.detect-diff.outputs.app_components }}) in namespace '${K8S_NAMESPACE}' and ready for Production release."
 
   # ============================================================
   # ROLLBACK PATH A: Auto Rollback (Stateless App Code Failure Only)
@@ -407,7 +510,7 @@ jobs:
     name: Auto Rollback Staging EKS
     needs: [detect-diff, deploy-staging, staging-tests]
     if: |
-      always() &&
+      !cancelled() &&
       needs.detect-diff.outputs.app_components != '[]' &&
       (needs.deploy-staging.outputs.rollback_mode == 'auto' || needs.staging-tests.outputs.rollback_mode == 'auto')
     runs-on: ubuntu-latest
@@ -423,16 +526,23 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Execute Immediate App Rollback
+        env:
+          DEPLOY_TYPE: ${{ inputs.deployment_type }}
         run: |
           echo "NOTE: DB migrations are NOT rolled back (Expand/Contract compatibility assumed)."
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
 
-          COMPONENTS=$(echo '${{ needs.detect-diff.outputs.app_components }}' | jq -r '.[]')
-          for COMP in $COMPONENTS; do
-            echo "Executing Auto-Rollback for deployment/${COMP}..."
-            kubectl rollout undo "deployment/${COMP}" -n "${K8S_NAMESPACE}"
-            kubectl rollout status "deployment/${COMP}" -n "${K8S_NAMESPACE}" --timeout=180s
-          done
+          if [ "$DEPLOY_TYPE" == "hotfix" ]; then
+            echo "Hotfix validation failed—deleting ephemeral namespace '${K8S_NAMESPACE}'..."
+            kubectl delete namespace "${K8S_NAMESPACE}" --ignore-not-found=true
+          else
+            COMPONENTS=$(echo '${{ needs.detect-diff.outputs.app_components }}' | jq -r '.[]')
+            for COMP in $COMPONENTS; do
+              echo "Executing Auto-Rollback for deployment/${COMP}..."
+              kubectl rollout undo "deployment/${COMP}" -n "${K8S_NAMESPACE}"
+              kubectl rollout status "deployment/${COMP}" -n "${K8S_NAMESPACE}" --timeout=180s
+            done
+          fi
 
       - name: Update Jira (Staging Rolled Back)
         uses: ./actions/jira-transition@main
@@ -450,7 +560,7 @@ jobs:
     name: Gated Rollback Staging EKS (Approval Required)
     needs: [detect-diff, deploy-staging, staging-tests]
     if: |
-      always() &&
+      !cancelled() &&
       needs.detect-diff.outputs.app_components != '[]' &&
       (needs.deploy-staging.outputs.rollback_mode == 'gated' || needs.staging-tests.outputs.rollback_mode == 'gated')
     runs-on: ubuntu-latest
@@ -468,16 +578,23 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Execute Approved App Rollback
+        env:
+          DEPLOY_TYPE: ${{ inputs.deployment_type }}
         run: |
           echo "Human approval granted. NOTE: DB migrations are NOT rolled back (Expand/Contract compatibility assumed)."
           aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
 
-          COMPONENTS=$(echo '${{ needs.detect-diff.outputs.app_components }}' | jq -r '.[]')
-          for COMP in $COMPONENTS; do
-            echo "Rolling back deployment/${COMP}..."
-            kubectl rollout undo "deployment/${COMP}" -n "${K8S_NAMESPACE}"
-            kubectl rollout status "deployment/${COMP}" -n "${K8S_NAMESPACE}" --timeout=180s
-          done
+          if [ "$DEPLOY_TYPE" == "hotfix" ]; then
+            echo "Deleting ephemeral namespace '${K8S_NAMESPACE}'..."
+            kubectl delete namespace "${K8S_NAMESPACE}" --ignore-not-found=true
+          else
+            COMPONENTS=$(echo '${{ needs.detect-diff.outputs.app_components }}' | jq -r '.[]')
+            for COMP in $COMPONENTS; do
+              echo "Rolling back deployment/${COMP}..."
+              kubectl rollout undo "deployment/${COMP}" -n "${K8S_NAMESPACE}"
+              kubectl rollout status "deployment/${COMP}" -n "${K8S_NAMESPACE}" --timeout=180s
+            done
+          fi
 
       - name: Update Jira (Staging Rolled Back)
         uses: ./actions/jira-transition@main
