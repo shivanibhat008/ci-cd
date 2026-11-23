@@ -143,21 +143,21 @@ jobs:
           #echo "Deployment failed health check! Rolling back cluster to previous version..."
           #kubectl rollout undo deployment/${COMPONENT} -n dev
 
-      - name: Deploy to Kubernetes Cluster
-        id: deploy
-        env:
-          COMPONENT: ${{ inputs.component }}
-        run: |
-          if [ "$COMPONENT" == "db-migrations" ]; then
-            echo "Running DB migration Job in dev..."
-            kubectl delete job db-migrations -n dev --ignore-not-found=true
-            kubectl apply -k k8s/overlays/dev
-            kubectl wait --for=condition=complete job/db-migrations -n dev --timeout=120s
-          else
-            echo "Deploying application: $COMPONENT to dev..."
-            kubectl apply -k k8s/overlays/dev
-            kubectl rollout status "deployment/${COMPONENT}" -n dev --timeout=90s
-          fi
+      # - name: Deploy to Kubernetes Cluster
+      #   id: deploy
+      #   env:
+      #     COMPONENT: ${{ inputs.component }}
+      #   run: |
+      #     if [ "$COMPONENT" == "db-migrations" ]; then
+      #       echo "Running DB migration Job in dev..."
+      #       kubectl delete job db-migrations -n dev --ignore-not-found=true
+      #       kubectl apply -k k8s/overlays/dev
+      #       kubectl wait --for=condition=complete job/db-migrations -n dev --timeout=120s
+      #     else
+      #       echo "Deploying application: $COMPONENT to dev..."
+      #       kubectl apply -k k8s/overlays/dev
+      #       kubectl rollout status "deployment/${COMPONENT}" -n dev --timeout=90s
+      #     fi
 
       - name: Commit and Push Changes
         if: success()
