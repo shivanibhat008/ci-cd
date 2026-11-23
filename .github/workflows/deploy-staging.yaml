@@ -3,13 +3,8 @@ name: Deploy to Staging
 on:
   workflow_dispatch:
     inputs:
-      jira_issue_key:
+      fix_version:
         description: "Jira Issue Key (e.g., PROJ-123)"
-        required: true
-        type: string
-  workflow_call:
-    inputs:
-      jira_issue_key:
         required: true
         type: string
 
@@ -141,7 +136,7 @@ jobs:
           jira-base-url: ${{ vars.JIRA_BASE_URL }}
           jira-user-email: ${{ secrets.JIRA_USER_EMAIL }}
           jira-api-token: ${{ secrets.JIRA_API_TOKEN }}
-          source-text: ${{ inputs.jira_issue_key }}
+          #source-text: ${{ inputs.jira_issue_key }}
           target-status: "Staging Deployment Failed"
 
       - name: Fail Job on DB Migration Failure
