@@ -3,7 +3,7 @@ kind: Kustomization
 namespace: dev
 resources:
 - ../../base/backend
-- ../../base/db-migration
+#- ../../base/db-migration
 - ../../base/frontend
 images:
 - name: backend
