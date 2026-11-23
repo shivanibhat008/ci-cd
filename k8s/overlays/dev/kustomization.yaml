@@ -1,15 +1,15 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: dev
+#- ../../base/db-migration
 resources:
 - ../../base/backend
-#- ../../base/db-migration
 - ../../base/frontend
 images:
 - name: backend
   newName: bhatshivani/backend
-  newTag: v4.0.1-sha-30b5d52
+  newTag: v4.0.5-sha-91db63b
 configMapGenerator:
 - literals:
-  - APP_VERSION=backend-v4.0.1-sha-30b5d52
+  - APP_VERSION=backend-v4.0.5-sha-91db63b
   name: backend-config
