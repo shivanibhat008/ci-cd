@@ -3,12 +3,21 @@ name: Deploy to Staging
 on:
   workflow_dispatch:
     inputs:
+      hotfix:
+        description: "Set to true if deploying a hotfix (reads changed components from Jira)"
+        required: false
+        type: boolean
+        default: false
       jira_issue_key:
         description: "Jira Issue Key (e.g., PROJ-123)"
         required: true
         type: string
   workflow_call:
     inputs:
+      hotfix:
+        required: false
+        type: boolean
+        default: false
       jira_issue_key:
         required: true
         type: string
@@ -27,7 +36,7 @@ env:
 
 jobs:
   # ============================================================
-  # STAGE 4: Detect Changed Components (Dev vs. Staging via yq)
+  # STAGE 4: Detect Changed Components (Hotfix via Jira OR Standard Dev vs. Staging)
   # ============================================================
   detect-diff:
     name: Detect Changed Components
@@ -40,36 +49,78 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Compare Dev and Staging Kustomize Overlays
+      - name: Detect Components (Hotfix via Jira or Dev vs. Staging Diff)
         id: diff
+        env:
+          IS_HOTFIX: ${{ inputs.hotfix }}
+          JIRA_KEY: ${{ inputs.jira_issue_key }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |
-          # 1. Check DB Migrations first (Priority)
-          DEV_DB=$(yq '.images[] | select(.name == "*db-migrations*") | .newTag' "$DEV_KUSTOMIZE")
-          STG_DB=$(yq '.images[] | select(.name == "*db-migrations*") | .newTag' "$STG_KUSTOMIZE")
+          CHANGED_APPS=()
 
-          if [ "$DEV_DB" != "$STG_DB" ] && [ -n "$DEV_DB" ]; then
-            echo "db_changed=true" >> "$GITHUB_OUTPUT"
-            echo "db_tag=$DEV_DB" >> "$GITHUB_OUTPUT"
-            echo "DB Migration changed: ${STG_DB:-none} -> $DEV_DB"
+          if [ "$IS_HOTFIX" == "true" ]; then
+            echo "Hotfix mode enabled. Fetching changed components from Jira issue: $JIRA_KEY"
+
+            JIRA_JSON=$(curl -sf \
+              -u "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" \
+              -H "Accept: application/json" \
+              "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_KEY}")
+
+            # Extract Jira Components (lowercased)
+            JIRA_COMPONENTS=$(echo "$JIRA_JSON" | jq -r '.fields.components[].name' | tr '[:upper:]' '[:lower:]')
+            echo "Jira components found: ${JIRA_COMPONENTS:-none}"
+
+            # 1. Check DB Migrations first (Priority)
+            if echo "$JIRA_COMPONENTS" | grep -qE '^(db|db-migrations)$'; then
+              DEV_DB=$(yq '.images[] | select(.name == "*db-migrations*") | .newTag' "$DEV_KUSTOMIZE")
+              echo "db_changed=true" >> "$GITHUB_OUTPUT"
+              echo "db_tag=$DEV_DB" >> "$GITHUB_OUTPUT"
+              echo "Hotfix includes DB Migration: $DEV_DB"
+            else
+              echo "db_changed=false" >> "$GITHUB_OUTPUT"
+              echo "db_tag=" >> "$GITHUB_OUTPUT"
+            fi
+
+            # 2. Check Application Components (Backend & Frontend)
+            for comp in backend frontend; do
+              if echo "$JIRA_COMPONENTS" | grep -qx "$comp"; then
+                CHANGED_APPS+=("$comp")
+                echo "Hotfix includes app component: $comp"
+              fi
+            done
+
           else
-            echo "db_changed=false" >> "$GITHUB_OUTPUT"
-            echo "db_tag=" >> "$GITHUB_OUTPUT"
+            echo "Standard mode enabled. Comparing Dev and Staging Kustomize overlays..."
+
+            # 1. Check DB Migrations first (Priority)
+            DEV_DB=$(yq '.images[] | select(.name == "*db-migrations*") | .newTag' "$DEV_KUSTOMIZE")
+            STG_DB=$(yq '.images[] | select(.name == "*db-migrations*") | .newTag' "$STG_KUSTOMIZE")
+
+            if [ "$DEV_DB" != "$STG_DB" ] && [ -n "$DEV_DB" ]; then
+              echo "db_changed=true" >> "$GITHUB_OUTPUT"
+              echo "db_tag=$DEV_DB" >> "$GITHUB_OUTPUT"
+              echo "DB Migration changed: ${STG_DB:-none} -> $DEV_DB"
+            else
+              echo "db_changed=false" >> "$GITHUB_OUTPUT"
+              echo "db_tag=" >> "$GITHUB_OUTPUT"
+            fi
+
+            # 2. Check Application Components (Backend & Frontend)
+            for comp in backend frontend; do
+              DEV_TAG=$(yq ".images[] | select(.name == \"*$comp*\") | .newTag" "$DEV_KUSTOMIZE")
+              STG_TAG=$(yq ".images[] | select(.name == \"*$comp*\") | .newTag" "$STG_KUSTOMIZE")
+
+              if [ "$DEV_TAG" != "$STG_TAG" ] && [ -n "$DEV_TAG" ]; then
+                CHANGED_APPS+=("$comp")
+                echo "$comp changed: ${STG_TAG:-none} -> $DEV_TAG"
+              fi
+            done
           fi
 
-          # 2. Check Application Components (Backend & Frontend)
-          CHANGED_APPS=()
-          for comp in backend frontend; do
-            DEV_TAG=$(yq ".images[] | select(.name == \"*$comp*\") | .newTag" "$DEV_KUSTOMIZE")
-            STG_TAG=$(yq ".images[] | select(.name == \"*$comp*\") | .newTag" "$STG_KUSTOMIZE")
-
-            if [ "$DEV_TAG" != "$STG_TAG" ] && [ -n "$DEV_TAG" ]; then
-              CHANGED_APPS+=("$comp")
-              echo "$comp changed: ${STG_TAG:-none} -> $DEV_TAG"
-            fi
-          done
-
           APPS_JSON=$(printf '%s\n' "${CHANGED_APPS[@]}" | jq -R . | jq -s -c 'map(select(length > 0))')
-          echo "Changed app components: $APPS_JSON"
+          echo "Target app components: $APPS_JSON"
           echo "app_components=$APPS_JSON" >> "$GITHUB_OUTPUT"
 
   # ============================================================
