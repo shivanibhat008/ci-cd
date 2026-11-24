@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: staging
-      url: https://example.com
+      url: ${{ steps.deploy.outputs.version_url }}   # Shows a "View deployment" button on
 
     steps:
       - name: Checkout repository
@@ -109,6 +109,21 @@ jobs:
           echo "Running DB migration Job (${{ needs.detect-diff.outputs.db_tag }}) in ${K8S_NAMESPACE}..."
           kubectl delete job "${DB_JOB_NAME}" -n "${K8S_NAMESPACE}" --ignore-not-found=true
           kubectl apply -k k8s/overlays/staging/db-migrations
+          # 2. Create a GitHub Deployment record with the exact version in the description
+          DEPLOY_ID=$(gh api repos/${{ github.repository }}/deployments \
+            -f ref="${{ github.sha }}" \
+            -f environment="staging" \
+            -f description="Deployed image: $IMAGE_TAG" \
+            -F auto_merge=false \
+            --jq '.id')
+
+          # 3. Mark the deployment active so it displays on the Environments dashboard
+          gh api repos/${{ github.repository }}/deployments/$DEPLOY_ID/statuses \
+            -f state="success" \
+            -f description="Live version: $IMAGE_TAG" \
+            -f environment_url="https://your-domain.com"
+
+          echo "version_url=https://your-domain.com" >> $GITHUB_OUTPUT
           kubectl wait --for=condition=complete "job/${DB_JOB_NAME}" -n "${K8S_NAMESPACE}" --timeout=180s
 
       - name: Collect DB Failure Logs
