@@ -5,7 +5,7 @@ metadata:
   name: fluentd-service-account
   namespace: amazon-cloudwatch
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/fluentd-prod-role
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/fluentd-dev-role
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -13,4 +13,4 @@ metadata:
   name: cloudwatch-agent-service-account
   namespace: amazon-cloudwatch
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/cw-agent-prod-role
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/cw-agent-dev-role
